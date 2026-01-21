@@ -1,0 +1,14 @@
+grid:
+  spacing: 0.5
+  box_size: [10.0, 10.0, 10.0]
+
+sampling:
+  n_samples: 10
+  min_distance: 1.5
+
+elements: ['H', 'C', 'N', 'O', 'Si']
+
+scf:
+  max_iter: 100
+  mix_alpha: 0.4
+  tolerance: 1e-5

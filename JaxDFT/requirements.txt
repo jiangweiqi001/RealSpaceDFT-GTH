@@ -1,0 +1,6 @@
+﻿jax
+jaxlib
+h5py
+pyyaml
+numpy
+scipy
