@@ -2,6 +2,7 @@
 
 import jax
 import jax.numpy as jnp
+from jax.scipy.special import erf
 
 
 @dataclass
@@ -52,7 +53,7 @@ def laplacian_4th(psi, spacing, mask):
     c0 = -2.5 / h2
     c1 = (4.0 / 3.0) / h2
     c2 = (-1.0 / 12.0) / h2
-    lap = c0 * psi
+    lap = 3.0 * c0 * psi
     lap += c1 * (jnp.roll(psi, 1, axis=0) + jnp.roll(psi, -1, axis=0))
     lap += c2 * (jnp.roll(psi, 2, axis=0) + jnp.roll(psi, -2, axis=0))
     lap += c1 * (jnp.roll(psi, 1, axis=1) + jnp.roll(psi, -1, axis=1))
@@ -65,7 +66,7 @@ def laplacian_4th(psi, spacing, mask):
 @jax.jit
 def gth_local_potential_value(r, zion, rloc, c):
     t = r / (jnp.sqrt(2.0) * rloc)
-    v_coul = -zion * (2.0 / jnp.sqrt(jnp.pi)) * jnp.exp(-t * t) / (r + 1e-12)
+    v_coul = -zion * erf(t) / (r + 1e-12)
     x = r / rloc
     gauss = jnp.exp(-0.5 * x * x)
     poly = c[..., 0] + c[..., 1] * (x * x) + c[..., 2] * (x ** 4) + c[..., 3] * (x ** 6)

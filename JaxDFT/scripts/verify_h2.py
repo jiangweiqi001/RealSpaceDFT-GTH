@@ -33,7 +33,7 @@ from src.hamiltonian import create_grid, prepare_system
 from src.io import load_pseudopotentials
 from src.solver import energy_and_forces
 
-def run_jaxdft(distances, spacing=0.3, box_size=[6.0, 6.0, 6.0]):
+def run_jaxdft(distances, spacing=0.5, box_size=[6.0, 6.0, 6.0]):
     print(f"\n正在运行 JaxDFT (格点间距={spacing}, 盒子大小={box_size})...")
     data_path = os.path.join(root, "data", "gth_potentials")
     # 加载 GTH 赝势
