@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-jax.config.update("jax_enable_x64", True)
+# [Auto-Disabled] jax.config.update("jax_enable_x64", True)
 
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, root)
@@ -19,9 +19,9 @@ from src.solver import energy_and_forces, ion_ion_energy, scf
 
 
 def build_occupations(pseudos):
-    electrons = jnp.sum(jnp.asarray([pp["q"] for pp in pseudos], dtype=jnp.float64))
+    electrons = jnp.sum(jnp.asarray([pp["q"] for pp in pseudos], dtype=jnp.float32))
     n_bands = int(jnp.ceil(electrons / 2.0))
-    occ = jnp.zeros((n_bands,), dtype=jnp.float64)
+    occ = jnp.zeros((n_bands,), dtype=jnp.float32)
     remaining = electrons
     for i in range(n_bands):
         occ = occ.at[i].set(jnp.minimum(2.0, remaining))
@@ -32,7 +32,7 @@ def build_occupations(pseudos):
 def scf_diagnostics(coords, spacing, box_size, pseudos, max_iter=150, mix_alpha=0.1, tolerance=1e-5, key=None):
     if key is None:
         key = jax.random.PRNGKey(0)
-    coords = jnp.asarray(coords, dtype=jnp.float64)
+    coords = jnp.asarray(coords, dtype=jnp.float32)
     grid = create_grid(spacing, box_size)
     grid = prepare_system(grid, coords, pseudos)
     electrons, n_bands, occ = build_occupations(pseudos)
@@ -49,7 +49,7 @@ def scf_diagnostics(coords, spacing, box_size, pseudos, max_iter=150, mix_alpha=
     e_loc = grid.volume_element * jnp.sum(rho * V_loc)
     e_xc = grid.volume_element * jnp.sum(eps_xc)
     e_vxc = grid.volume_element * jnp.sum(rho * v_xc)
-    ion = ion_ion_energy(coords, jnp.asarray([pp["zion"] for pp in pseudos], dtype=jnp.float64))
+    ion = ion_ion_energy(coords, jnp.asarray([pp["zion"] for pp in pseudos], dtype=jnp.float32))
     total = e_band - e_h + e_loc + e_xc - e_vxc + ion
     kinetic = e_band - e_loc - e_h - e_vxc
     rho_int = grid.volume_element * jnp.sum(rho)
@@ -94,8 +94,8 @@ def main():
 
     d = 0.8
     offset = d / 2.0
-    coords_sym = np.array([[0.0, 0.0, -offset], [0.0, 0.0, offset]], dtype=np.float64)
-    coords_break = np.array([[0.0, 0.0, -0.4], [0.0, 0.0, 0.5]], dtype=np.float64)
+    coords_sym = np.array([[0.0, 0.0, -offset], [0.0, 0.0, offset]], dtype=np.float32)
+    coords_break = np.array([[0.0, 0.0, -0.4], [0.0, 0.0, 0.5]], dtype=np.float32)
 
     for spacing in [0.5, 0.3, 0.2]:
         key = jax.random.PRNGKey(int(spacing * 1000))
