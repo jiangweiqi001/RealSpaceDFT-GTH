@@ -186,6 +186,7 @@ def ion_ion_energy(coords, zion):
 
 
 def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key):
+    # 1. Setup Parameters
     zion = jnp.asarray([pp["zion"] for pp in pseudos], dtype=jnp.float64)
     rloc = jnp.asarray([pp["rloc"] for pp in pseudos], dtype=jnp.float64)
     c = jnp.asarray([pp["c"] for pp in pseudos], dtype=jnp.float64)
@@ -204,22 +205,47 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         occ = occ.at[i].set(jnp.minimum(2.0, remaining))
         remaining = remaining - occ[i]
 
-    def energy_fn(atom_coords):
-        V_loc = build_local_potential(atom_coords, grid.coords, zion, rloc, c)
-        V_loc = jnp.nan_to_num(V_loc, nan=0.0, posinf=0.0, neginf=0.0)
-        rho, eigvals, eigvecs, V_H, eps_xc, v_xc = scf(
-            grid, atom_coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key
-        )
-        rho = jax.lax.stop_gradient(rho)
-        eigvals = jax.lax.stop_gradient(eigvals)
-        V_H = jax.lax.stop_gradient(V_H)
-        eps_xc = jax.lax.stop_gradient(eps_xc)
-        ion_e = ion_ion_energy(atom_coords, zion)
-        e = total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, grid.volume_element, ion_e)
-        return e
+    # 2. Run SCF
+    # Build V_loc once for SCF
+    V_loc_init = build_local_potential(coords, grid.coords, zion, rloc, c)
+    V_loc_init = jnp.nan_to_num(V_loc_init, nan=0.0, posinf=0.0, neginf=0.0)
 
-    energy, grad = jax.value_and_grad(energy_fn)(coords)
-    forces = -grad
+    rho, eigvals, eigvecs, V_H, eps_xc, v_xc = scf(
+        grid, coords, n_bands, occ, V_loc_init, projectors, max_iter, mix_alpha, tolerance, key
+    )
+
+    # 3. Stop Gradients (Variational Principle)
+    rho_fixed = jax.lax.stop_gradient(rho)
+    eigvals_fixed = jax.lax.stop_gradient(eigvals)
+    V_H_fixed = jax.lax.stop_gradient(V_H)
+    eps_xc_fixed = jax.lax.stop_gradient(eps_xc)
+    v_xc_fixed = jax.lax.stop_gradient(v_xc)
+    V_loc_fixed = jax.lax.stop_gradient(V_loc_init)
+
+    # 4. Calculate Energy (Standard Formula)
+    ion_e = ion_ion_energy(coords, zion)
+    energy = total_energy(
+        rho_fixed, eigvals_fixed, occ, V_loc_fixed, V_H_fixed, eps_xc_fixed, v_xc_fixed, grid.volume_element, ion_e
+    )
+
+    # 5. Calculate Forces Explicitly (Hellmann-Feynman)
+    # Force_elec = - Integral [ rho(r) * Gradient_R( V_loc(r, R) ) ]
+
+    def interaction_energy_fn(at_coords):
+        # Re-build potential to trace gradients w.r.t atom coordinates
+        V_loc_vars = build_local_potential(at_coords, grid.coords, zion, rloc, c)
+        V_loc_vars = jnp.nan_to_num(V_loc_vars, nan=0.0, posinf=0.0, neginf=0.0)
+        return jnp.sum(rho_fixed * V_loc_vars) * grid.volume_element
+
+    # The gradient of interaction energy is -Force_elec
+    grad_elec = jax.grad(interaction_energy_fn)(coords)
+
+    # Ion-Ion Force
+    grad_ion = jax.grad(ion_ion_energy)(coords, zion)
+
+    # Total Force = - (Gradient of Ion Energy + Gradient of Electron-Ion Interaction)
+    forces = -grad_ion - grad_elec
+
     return energy, forces
 
 
