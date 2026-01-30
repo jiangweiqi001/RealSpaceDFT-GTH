@@ -1,2 +1,5 @@
-Running verification with spacing=0.3, box=[6.0, 6.0, 6.0]...
-Grid points: 9261, Dense matrix ~ 654.3 MB
+
+Traceback (most recent call last):
+  File "/home/jwq/基于随机原子分布的构型空间采样/JaxDFT/scripts/verify_h2.py", line 9, in <module>
+    import jax
+ModuleNotFoundError: No module named 'jax'

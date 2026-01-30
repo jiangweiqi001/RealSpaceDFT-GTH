@@ -150,7 +150,7 @@ def parse_gth_text(text):
     n_gauss = int(local_tokens[1])
     c = np.array([float(x) for x in local_tokens[2:2 + n_gauss]], dtype=float)
     c = np.pad(c, (0, max(0, 4 - c.size)), constant_values=0.0)
-    zion = PERIODIC_TABLE[symbol] - q
+    zion = float(q)
     local = GTHLocal(zion=zion, rloc=rloc, c=c)
     projectors = []
     idx = 3

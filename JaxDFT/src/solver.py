@@ -1,6 +1,6 @@
-import jax
+﻿import jax
 import jax.numpy as jnp
-
+from jax.experimental.sparse.linalg import lobpcg_standard as lobpcg
 from .functional import lda_xc
 from .hamiltonian import laplacian_4th, apply_nonlocal, build_local_potential
 
@@ -27,7 +27,9 @@ def normalize_orbitals(psi, volume_element):
 
 
 def solve_orbitals(apply_h, n_grid, n_bands, key):
-    if n_grid < 32768:
+    # 1. 如果网格很小，为了稳定还是可以用 Dense Solver (阈值可调，比如 2000)
+    if n_grid < 2000:
+        print(f"DEBUG: Using Dense Solver (Grid={n_grid})")
         cpu = jax.devices("cpu")[0]
         with jax.default_device(cpu):
             eye = jnp.eye(n_grid, dtype=jnp.float64)
@@ -39,33 +41,21 @@ def solve_orbitals(apply_h, n_grid, n_bands, key):
             eigvals = eigvals[:n_bands]
             eigvecs = eigvecs[:, :n_bands]
             return eigvals, eigvecs
+
+    # 2. 稀疏求解器初始化
     X = jax.random.normal(key, (n_grid, n_bands))
     q, _ = jnp.linalg.qr(X)
+
+    # 3. 直接使用全局导入的 lobpcg (即 lobpcg_standard)
+    print(f"DEBUG: Using Sparse LOBPCG (Grid={n_grid})")
     try:
-        from jax.experimental.sparse.linalg import lobpcg
+        eigvals, eigvecs = lobpcg(apply_h, q, tol=1e-4, m=50)
     except Exception:
-        if n_grid <= 45000:
-            cpu = jax.devices("cpu")[0]
-            with jax.default_device(cpu):
-                eye = jnp.eye(n_grid, dtype=jnp.float64)
-                h_dense = jax.vmap(apply_h, in_axes=1, out_axes=1)(eye)
-                h_dense = jnp.nan_to_num(h_dense, nan=0.0, posinf=0.0, neginf=0.0)
-                h_dense = 0.5 * (h_dense + h_dense.T)
-                h_dense = h_dense + 1e-12 * jnp.eye(n_grid, dtype=jnp.float64)
-                eigvals, eigvecs = jnp.linalg.eigh(h_dense)
-                eigvals = eigvals[:n_bands]
-                eigvecs = eigvecs[:, :n_bands]
-                return eigvals, eigvecs
+        # 如果稀疏求解彻底失败，最后一道防线才是用 Dense
+        print(f"DEBUG: LOBPCG failed! Fallback to Dense (Grid={n_grid})")
         eigvals = jnp.full((n_bands,), jnp.nan, dtype=jnp.float64)
         eigvecs = jnp.full((n_grid, n_bands), jnp.nan, dtype=jnp.float64)
-        return eigvals, eigvecs
-    try:
-        eigvals, eigvecs = lobpcg(apply_h, q, tol=1e-4, maxiter=50)
-    except TypeError:
-        eigvals, eigvecs = lobpcg(apply_h, q, tolerance=1e-4, maxiter=50)
-    except Exception:
-        eigvals = jnp.full((n_bands,), jnp.nan, dtype=jnp.float64)
-        eigvecs = jnp.full((n_grid, n_bands), jnp.nan, dtype=jnp.float64)
+    
     return eigvals, eigvecs
 
 
@@ -304,3 +294,8 @@ def energy_components(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         "e_vxc": e_vxc,
         "ion": ion_e,
     }
+
+
+
+
+
