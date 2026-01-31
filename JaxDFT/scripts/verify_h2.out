@@ -1,5 +1,0 @@
-
-Traceback (most recent call last):
-  File "/home/jwq/基于随机原子分布的构型空间采样/JaxDFT/scripts/verify_h2.py", line 9, in <module>
-    import jax
-ModuleNotFoundError: No module named 'jax'

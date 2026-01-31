@@ -1,4 +1,11 @@
-﻿import os
+"""I/O utilities for pseudopotentials, configuration, and dataset storage.
+
+Pseudopotentials follow a simplified GTH-like text format. Dataset outputs are
+stored in HDF5 with atomic units: coordinates in Bohr, energies in Hartree,
+and forces in Hartree/Bohr.
+"""
+
+import os
 from dataclasses import dataclass
 
 import h5py
@@ -61,6 +68,14 @@ VALENCE_Q = {
 
 
 def _base_params(symbol):
+    """Generate heuristic GTH-like parameters for an element symbol.
+
+    Args:
+        symbol: Chemical symbol (e.g., "H", "C").
+
+    Returns:
+        Tuple (rloc, c, proj_r, h) defining local and projector parameters.
+    """
     z = PERIODIC_TABLE[symbol]
     rloc = 0.18 + 0.006 * z
     c1 = -3.5 - 0.03 * z
@@ -87,6 +102,7 @@ for _sym in PERIODIC_TABLE:
 
 @dataclass
 class GTHLocal:
+    """Local part of a GTH pseudopotential."""
     zion: float
     rloc: float
     c: np.ndarray
@@ -94,6 +110,7 @@ class GTHLocal:
 
 @dataclass
 class GTHProjector:
+    """Single angular-momentum projector channel for a GTH pseudopotential."""
     l: int
     r: float
     h: np.ndarray
@@ -102,6 +119,7 @@ class GTHProjector:
 
 @dataclass
 class GTHPP:
+    """Container for a parsed GTH pseudopotential."""
     symbol: str
     q: int
     local: GTHLocal
@@ -109,6 +127,15 @@ class GTHPP:
 
 
 def gth_to_text(symbol, params):
+    """Serialize GTH parameters to a text block.
+
+    Args:
+        symbol: Chemical symbol.
+        params: Parameter dictionary with keys q, rloc, c, projectors.
+
+    Returns:
+        Text block suitable for writing to a .txt pseudopotential file.
+    """
     q = int(params["q"])
     rloc = float(params["rloc"])
     c = params["c"]
@@ -129,6 +156,11 @@ def gth_to_text(symbol, params):
 
 
 def initialize_gth_potentials(data_dir):
+    """Create default GTH pseudopotential files if missing.
+
+    Args:
+        data_dir: Directory to store pseudopotential text files.
+    """
     os.makedirs(data_dir, exist_ok=True)
     existing = [f for f in os.listdir(data_dir) if f.endswith(".txt")]
     if existing:
@@ -141,6 +173,14 @@ def initialize_gth_potentials(data_dir):
 
 
 def parse_gth_text(text):
+    """Parse a GTH pseudopotential text block.
+
+    Args:
+        text: Contents of a .txt pseudopotential file.
+
+    Returns:
+        GTHPP object with local and projector parameters.
+    """
     lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     header = lines[0].split()
     symbol = header[0]
@@ -175,6 +215,15 @@ def parse_gth_text(text):
 
 
 def load_pseudopotentials(symbols, data_dir):
+    """Load pseudopotentials for a list of elements.
+
+    Args:
+        symbols: List of element symbols.
+        data_dir: Directory containing GTH pseudopotential files.
+
+    Returns:
+        List of dictionaries with local and projector parameters.
+    """
     initialize_gth_potentials(data_dir)
     pseudos = []
     for sym in symbols:
@@ -203,11 +252,28 @@ def load_pseudopotentials(symbols, data_dir):
 
 
 def load_config(path):
+    """Load a YAML configuration file.
+
+    Args:
+        path: Path to the YAML file.
+
+    Returns:
+        Parsed configuration dictionary.
+    """
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
 def write_hdf5(path, coords_list, z_list, energy_list, forces_list):
+    """Write dataset arrays to an HDF5 file.
+
+    Args:
+        path: Output file path.
+        coords_list: List/array of atomic coordinates, in Bohr.
+        z_list: List/array of atomic numbers (dimensionless).
+        energy_list: List/array of total energies, in Hartree.
+        forces_list: List/array of forces, in Hartree/Bohr.
+    """
     coords = np.asarray(coords_list, dtype=float)
     zvals = np.asarray(z_list, dtype=int)
     energies = np.asarray(energy_list, dtype=float)

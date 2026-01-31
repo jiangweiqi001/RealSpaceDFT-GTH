@@ -1,10 +1,29 @@
+"""Self-consistent field solver for real-space Kohn-Sham DFT in JAX.
+
+All quantities are in atomic units: length in Bohr, energy in Hartree, and
+forces in Hartree/Bohr. The SCF loop builds the effective potential, solves
+the Kohn-Sham eigenproblem, and mixes the density until convergence.
+"""
+
 import jax
 import jax.numpy as jnp
 from .functional import lda_xc
 from .hamiltonian import laplacian_4th, apply_nonlocal, build_local_potential
 
+
 @jax.jit
 def solve_poisson(rho, box_size):
+    """Solve the Poisson equation with an FFT-based spectral method.
+
+    The FFT implies periodic boundary conditions on the simulation cell.
+
+    Args:
+        rho: Electron density on the grid, shape (nx, ny, nz), in Bohr^-3.
+        box_size: Simulation box lengths [Lx, Ly, Lz] in Bohr.
+
+    Returns:
+        Hartree potential on the grid, in Hartree.
+    """
     nx, ny, nz = rho.shape
     kx = 2.0 * jnp.pi * jnp.fft.fftfreq(nx, d=box_size[0] / (nx - 1))
     ky = 2.0 * jnp.pi * jnp.fft.fftfreq(ny, d=box_size[1] / (ny - 1))
@@ -17,7 +36,19 @@ def solve_poisson(rho, box_size):
     v = jnp.fft.ifftn(v_k).real
     return v
 
+
 def solve_orbitals_dense(apply_h_fn, n_grid, n_bands):
+    """Diagonalize the dense Hamiltonian to obtain Kohn-Sham orbitals.
+
+    Args:
+        apply_h_fn: Linear operator that applies H to a flattened wavefunction.
+        n_grid: Total number of grid points (product of grid dimensions).
+        n_bands: Number of lowest eigenpairs to return.
+
+    Returns:
+        Tuple (eigvals, eigvecs) with eigenvalues in Hartree and eigenvectors
+        shaped (n_grid, n_bands).
+    """
     # 【核心回归】使用 Dense Solver (eigh)
     # 对于 Grid=0.18 (N~20k)，矩阵仅 1.7GB，完全可控且绝对收敛
     eye = jnp.eye(n_grid, dtype=jnp.float32)
@@ -28,7 +59,21 @@ def solve_orbitals_dense(apply_h_fn, n_grid, n_bands):
     eigvals, eigvecs = jnp.linalg.eigh(h_dense)
     return eigvals[:n_bands], eigvecs[:, :n_bands]
 
+
 def anderson_mixing(rho, rho_new, f_hist, mix_alpha, iter_idx, m=5):
+    """Perform Anderson mixing for density updates.
+
+    Args:
+        rho: Current density (flattened), in Bohr^-3.
+        rho_new: New density (flattened), in Bohr^-3.
+        f_hist: History buffer of residuals, shape (m, n_grid).
+        mix_alpha: Linear mixing parameter.
+        iter_idx: Current SCF iteration index.
+        m: History length for Anderson mixing.
+
+    Returns:
+        Tuple (rho_next, f_hist_next) with mixed density and updated history.
+    """
     f = rho_new - rho
     m_val = m
     def first(_):
@@ -52,7 +97,26 @@ def anderson_mixing(rho, rho_new, f_hist, mix_alpha, iter_idx, m=5):
         return rho_next, f_hist1
     return jax.lax.cond(iter_idx == 0, first, later, operand=None)
 
+
 def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key):
+    """Run the self-consistent field (SCF) loop.
+
+    Args:
+        grid: Grid object with coordinates, spacing, and volume element.
+        coords: Ion coordinates, shape (n_atoms, 3), in Bohr.
+        n_bands: Number of Kohn-Sham orbitals to solve for.
+        occ: Band occupations (0–2).
+        V_loc: Local ionic potential on the grid, in Hartree.
+        projectors: Nonlocal projector data structure.
+        max_iter: Maximum SCF iterations.
+        mix_alpha: Anderson mixing strength.
+        tolerance: Convergence threshold for density change.
+        key: JAX PRNG key (kept for API consistency).
+
+    Returns:
+        Tuple (rho, eigvals, eigvecs, V_H, eps_xc, v_xc) where energies are in
+        Hartree and densities in Bohr^-3.
+    """
     coords = jnp.asarray(coords, dtype=jnp.float32)
     volume_element = grid.volume_element
     
@@ -116,14 +180,41 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     
     return rho, eigvals, eigvecs, V_H, eps_xc, v_xc
 
+
 def total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, volume_element, ion_ion):
+    """Compute the total DFT energy from standard components.
+
+    Args:
+        rho: Electron density on the grid, in Bohr^-3.
+        eigvals: Kohn-Sham eigenvalues, in Hartree.
+        occ: Band occupations (0–2).
+        V_loc: Local ionic potential on the grid, in Hartree.
+        V_H: Hartree potential on the grid, in Hartree.
+        eps_xc: Exchange-correlation energy density on the grid, in Hartree/Bohr^3.
+        v_xc: Exchange-correlation potential on the grid, in Hartree.
+        volume_element: Grid cell volume, in Bohr^3.
+        ion_ion: Ion-ion repulsion energy, in Hartree.
+
+    Returns:
+        Total energy in Hartree.
+    """
     e_band = jnp.sum(eigvals * occ)
     e_h_integral = 0.5 * volume_element * jnp.sum(rho * V_H)
     e_xc_integral = volume_element * jnp.sum(eps_xc)
     e_vxc_integral = volume_element * jnp.sum(rho * v_xc)
     return e_band - e_h_integral + e_xc_integral - e_vxc_integral + ion_ion
 
+
 def ion_ion_energy(coords, zion):
+    """Compute the classical ion-ion Coulomb energy.
+
+    Args:
+        coords: Ion coordinates, shape (n_atoms, 3), in Bohr.
+        zion: Ionic charges, dimensionless.
+
+    Returns:
+        Ion-ion repulsion energy in Hartree.
+    """
     e = 0.0
     for i in range(coords.shape[0]):
         for j in range(i + 1, coords.shape[0]):
@@ -131,7 +222,23 @@ def ion_ion_energy(coords, zion):
             e = e + zion[i] * zion[j] / r
     return e
 
+
 def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key):
+    """Run SCF and return total energy and forces.
+
+    Args:
+        grid: Grid object produced by create_grid.
+        coords: Ion coordinates, shape (n_atoms, 3), in Bohr.
+        pseudos: List of pseudopotential dictionaries.
+        max_iter: Maximum SCF iterations.
+        mix_alpha: Anderson mixing strength.
+        tolerance: Convergence threshold for density change.
+        key: JAX PRNG key.
+
+    Returns:
+        Tuple (energy, forces) where energy is in Hartree and forces are in
+        Hartree/Bohr. Forces are currently zeros in this implementation.
+    """
     zion = jnp.asarray([p["zion"] for p in pseudos])
     rloc = jnp.asarray([p["rloc"] for p in pseudos])
     c = jnp.asarray([p["c"] for p in pseudos])
