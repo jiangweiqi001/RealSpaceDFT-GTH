@@ -11,6 +11,55 @@ from .functional import lda_xc
 from .hamiltonian import laplacian_4th, apply_nonlocal, build_local_potential
 
 
+
+def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100, tol=1e-4):
+    """Iterative solver using Safe Gradient Descent.
+    Uses a small step size to prevent divergence on fine grids.
+    """
+    key = jax.random.PRNGKey(42)
+    if x_init is None:
+        X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
+    else:
+        X = x_init
+
+    # 初始正交化
+    X = jnp.linalg.qr(X)[0]
+
+    def body_fun(state):
+        i, X, E = state
+        
+        # 1. Apply H
+        HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
+        
+        # 2. Rayleigh Quotient
+        E = jnp.sum(X * HX, axis=0)
+        
+        # 3. Residual
+        R = HX - X * E[None, :]
+        
+        # 4. Update with SAFE step size
+        # Grid spacing 0.22 => E_max ~ 250 Ha. Safe alpha < 2/250 = 0.008.
+        # We use 0.005 to be ultra-safe.
+        alpha = 0.002 
+        X_new = X - alpha * R
+        
+        # 5. Re-orthogonalize (Critical for stability)
+        X_new = jnp.linalg.qr(X_new)[0]
+        
+        return i + 1, X_new, E
+
+    final_state = jax.lax.while_loop(
+        lambda s: s[0] < max_iter,
+        body_fun,
+        (0, X, jnp.zeros(n_bands))
+    )
+    
+    _, X_final, E_final = final_state
+    return E_final, X_final
+
+
+
+
 @jax.jit
 def solve_poisson(rho, box_size):
     """Solve the Poisson equation with an FFT-based spectral method.
@@ -144,7 +193,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         return jnp.logical_and(i < max_iter, diff > tolerance)
 
     def body(state):
-        i, rho_cur, f_hist_cur, diff, _, _, _, _, _ = state
+        i, rho_cur, f_hist_cur, diff, _, eigvecs0, _, _, _ = state
         rho_cur = jnp.clip(rho_cur, 1e-12, None)
         V_H = solve_poisson(rho_cur, grid.box_size)
         eps_xc, v_xc = lda_xc(rho_cur)
@@ -157,7 +206,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             return hpsi.reshape(-1)
 
         # 换回 Dense Solver
-        eigvals, eigvecs = solve_orbitals_dense(apply_h, n_grid, n_bands)
+        eigvals, eigvecs = solve_orbitals_lobpcg(apply_h, n_grid, n_bands, x_init=eigvecs0)
         
         # 归一化
         norm = jnp.sqrt(jnp.sum(eigvecs**2, axis=0) * volume_element)

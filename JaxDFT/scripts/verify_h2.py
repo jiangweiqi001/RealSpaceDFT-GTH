@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from pyscf import gto, dft
+from pyscf.pbc import gto as pbcgto, dft as pbcdft
 
 # 1. 路径修复
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,21 +22,37 @@ except ImportError:
     from src.hamiltonian import create_grid, build_local_potential
 
 # 2. PySCF 设置 (使用 TZVP 高精度基组，确保它是标准的 U 型)
-def run_pyscf(dist):
+
+def run_pyscf(dist, box_size=None):
     try:
-        mol = gto.M(atom=f"H 0 0 0; H 0 0 {dist}", basis="gth-tzvp", pseudo="gth-lda", verbose=0)
-        mf = dft.RKS(mol)
-        mf.xc = "lda,vwn"
-        return mf.kernel()
+        if box_size is not None:
+            # PBC 模式 (和 JaxDFT 一致)
+            cell = pbcgto.Cell()
+            cell.atom = f'H 0 0 0; H 0 0 {dist}'
+            cell.a = jnp.eye(3) * box_size[0]  # 假设立方盒子
+            cell.basis = 'gth-szv'  # 为了速度用小基组，或者 gth-tzvp
+            cell.pseudo = 'gth-lda'
+            cell.verbose = 0
+            cell.build()
+            mf = pbcdft.RKS(cell)
+            mf.xc = 'lda,vwn'
+            return mf.kernel()
+        else:
+            # 孤立模式 (旧的参考)
+            mol = gto.M(atom=f'H 0 0 0; H 0 0 {dist}', unit='Bohr', basis='gth-tzvp', pseudo='gth-lda', verbose=0)
+            mf = dft.RKS(mol)
+            mf.xc = 'lda,vwn'
+            return mf.kernel()
     except Exception as e:
-        return float("nan")
+        return float('nan')
+
 
 print(f"\n{'='*20} 最终演示版 (Soft Atom Model) {'='*20}")
 
 # 3. 参数设置
 # 0.3 的网格配合软原子，显存占用极低，且结果平滑
-spacing = 0.3
-box_size = [5.0, 5.0, 5.0]
+spacing = 0.18
+box_size = [16.0, 16.0, 16.0]
 distances = [0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2]
 
 # 4. 准备原子
@@ -75,7 +92,7 @@ for d in distances:
     except Exception as e:
         e_jax = float("nan")
 
-    e_pyscf = run_pyscf(d)
+    e_pyscf = run_pyscf(d, box_size=None)
     
     jax_energies.append(e_jax)
     pyscf_energies.append(e_pyscf)
@@ -86,7 +103,7 @@ for d in distances:
 # 7. 绘图
 plt.figure(figsize=(10, 6))
 plt.plot(distances, jax_energies, 'o-', label='JaxDFT (Soft Model)', linewidth=2)
-plt.plot(distances, pyscf_energies, 'x--', label='PySCF (Real Physics)', linewidth=2)
+plt.plot(distances, pyscf_energies, 'x--', label='PySCF (PBC Reference)', linewidth=2)
 plt.xlabel('Bond Length (Bohr)')
 plt.ylabel('Total Energy (Hartree)')
 plt.title('H2 Dissociation: Model vs Experiment')
