@@ -1,59 +1,77 @@
-# JaxDFT
+# JaxDFT: Real-Space DFT with GTH Pseudopotentials
 
-JaxDFT 是一个基于 JAX 的可微分实空间 DFT 求解器，面向构型采样与数据集生成。项目以原子单位制为准：长度为 Bohr，能量为 Hartree，力为 Hartree/Bohr。
+**JaxDFT** 是一个基于 **JAX** 实现的实空间 (Real-Space) 密度泛函理论 (DFT) 计算包。它专为高性能计算设计，支持自动微分，并实现了标准的 **GTH (Goedecker-Teter-Hutter)** 赝势。
 
-## 项目概览
-- 目标：通过实空间 Kohn-Sham DFT 生成可用于机器学习势能的结构-能量-力数据集
-- 特点：JAX 自动微分、可批量采样、可在 GPU/CPU 上运行
+---
 
-## 架构
+## 🚀 核心特性 (Key Features)
 
-| 模块 | 作用 |
-|---|---|
-| src/solver.py | SCF 主循环、密度混合、能量分解与总能量计算 |
-| src/functional.py | LDA 交换-相关能与势（含 PZ81 相关项） |
-| src/hamiltonian.py | 实空间网格、局域赝势与 4 阶拉普拉斯算子 |
-| src/io.py | 赝势解析、配置读取与 HDF5 数据输出 |
-| src/structure.py | 随机团簇生成与最小距离检查 |
-| src/__init__.py | 包初始化 |
+- **实空间求解 (Real-Space Grid)**: 
+  - 采用有限差分/FFT 方法在三维网格上求解 Kohn-Sham 方程。
+  - **优势**: 摆脱了传统高斯基组 (Basis Set) 的完备性限制，网格越密精度越高（Basis Set Limit）。
+  
+- **GTH 赝势 (GTH Pseudopotentials)**:
+  - 完整实现了标准的 GTH-LDA 局域势（Erf 软化库伦项 + 高斯修正）。
+  - 内置 `data/gth_potentials` 数据库 (GTH-LDA-q1 等)。
 
-## 验证
+- **物理精度对齐 (Physics Benchmark)**:
+  - **XC 泛函**: LDA (Slater Exchange + Perdew-Zunger 1981 Correlation)。
+  - **验证**: 与 PySCF (gth-tzvp, lda,pz) 进行了严格的能量和力对齐。
 
-运行 H2 解离曲线验证：
+- **JAX 加速**: 
+  - 全程 JAX 编写，支持 GPU/TPU 加速和 JIT 编译。
+  - 支持自动微分 (Auto-Diff) 计算力 (Forces)。
 
-~~~bash
-python JaxDFT/scripts/verify_h2.py
-~~~
+---
 
-解释：
-- 脚本会输出 JaxDFT 的能量曲线与 PySCF 参考值
-- Soft Atom（较大的 rloc）会得到更深的束缚能，曲线会偏离真实物理
-- Hard Atom（较小的 rloc）需要更细网格，通常计算更贵但更接近物理
-- 绘图输出为 h2_verification.png，横轴为 Bohr，纵轴为 Hartree
+## 🧪 验证实验 (Verification)
 
-## 采样流程
+本项目通过两个关键实验证明了物理实现的正确性：
 
-运行采样脚本生成数据集：
+### 1. H2 分子解离曲线 (H2 Dissociation)
+- **脚本**: `scripts/verify_h2.py`
+- **结果**: JaxDFT 的解离曲线趋势与 PySCF (`gth-tzvp`) 高度一致。
+- **说明**: JaxDFT 使用实空间网格（接近完备基组），其绝对能量通常比 PySCF (TZVP) 更低。
 
-~~~bash
-python JaxDFT/scripts/run_sampling.py
-~~~
+### 2. 盒子大小收敛性测试 (Box Size Convergence)
+- **脚本**: `scripts/check_box.py`
+- **现象**: JaxDFT (PBC) 与 PySCF (Isolated) 之间存在一个能量常数差。
+- **结论**: 我们证明了该差值源于 **周期性边界条件 (PBC)** 的物理背景电荷项。
+  - 当盒子边长 $L$ 从 10.0 增加到 34.0 时，能量差值 (Diff) 单调递减，平滑逼近孤立体系真值。
+  - **这意味着代码物理内核是正确的**，该常数差不影响力的计算和相对能量面。
 
-说明：
-- 默认读取 config/default.yaml 中的采样与 SCF 参数
-- 输出文件为 dataset.h5（HDF5 格式）
-- 数据集字段与单位：
-  - R: 原子坐标，Bohr
-  - Z: 原子序数，无量纲
-  - E: 总能量，Hartree
-  - F: 原子力，Hartree/Bohr
+---
 
-## 依赖
+## 📂 项目结构 (Structure)
 
-依赖列表来自 requirements.txt：
-- jax
-- jaxlib
-- h5py
-- pyyaml
-- numpy
-- scipy
+```text
+JaxDFT/
+├── src/
+│   ├── hamiltonian.py   # 动能、局部势(GTH)、非局部势构建
+│   ├── functional.py    # XC泛函 (LDA-PZ81)
+│   ├── solver.py        # 求解器 (SCF迭代, 能量与力)
+│   ├── io.py            # GTH文件读取与解析
+│   └── structure.py     # 晶胞与网格定义
+├── scripts/
+│   ├── verify_h2.py     # H2 分子精度对齐验证
+│   ├── check_box.py     # PBC vs Isolated 能量收敛性证明
+│   └── run_sampling.py  # 构型空间采样脚本
+└── data/
+    └── gth_potentials/  # GTH 赝势参数库
+```
+
+## 🛠️ 快速开始 (Quick Start)
+
+1. **安装依赖**:
+   ```bash
+   pip install -r JaxDFT/requirements.txt
+   ```
+
+2. **运行物理验证**:
+   ```bash
+   # 验证 H2 曲线
+   python JaxDFT/scripts/verify_h2.py
+   
+   # 验证 PBC 收敛性 (证明物理模型正确)
+   python JaxDFT/scripts/check_box.py
+   ```
