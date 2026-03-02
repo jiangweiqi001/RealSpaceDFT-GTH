@@ -90,32 +90,29 @@ def build_local_potential(atom_coords, grid_coords, zion, rloc, c):
     return V_total
 
 
+def shift_array(arr, shift, axis):
+    rolled = jnp.roll(arr, shift, axis=axis)
+    if axis == 0:
+        rolled = jnp.where(jnp.arange(arr.shape[0])[:, None, None] < shift if shift > 0 else jnp.arange(arr.shape[0])[:, None, None] >= arr.shape[0] + shift, 0.0, rolled)
+    elif axis == 1:
+        rolled = jnp.where(jnp.arange(arr.shape[1])[None, :, None] < shift if shift > 0 else jnp.arange(arr.shape[1])[None, :, None] >= arr.shape[1] + shift, 0.0, rolled)
+    elif axis == 2:
+        rolled = jnp.where(jnp.arange(arr.shape[2])[None, None, :] < shift if shift > 0 else jnp.arange(arr.shape[2])[None, None, :] >= arr.shape[2] + shift, 0.0, rolled)
+    return rolled
+
 @jax.jit
 def laplacian_4th(psi, spacing, mask=None):
-    """Compute the 4th-order finite-difference Laplacian in 3D.
-
-    The stencil uses periodic shifts via jnp.roll. An optional mask can zero out
-    regions (e.g., outside a physical domain).
-
-    Args:
-        psi: Scalar field on the grid.
-        spacing: Grid spacing in Bohr.
-        mask: Optional multiplicative mask, same shape as psi.
-
-    Returns:
-        Laplacian of psi, in Bohr^-2 times psi units.
-    """
     h2 = spacing * spacing
     c0 = -2.5 / h2
     c1 = (4.0/3.0) / h2
     c2 = (-1.0/12.0) / h2
     lap = 3.0 * c0 * psi
-    lap += c1 * (jnp.roll(psi, 1, axis=0) + jnp.roll(psi, -1, axis=0))
-    lap += c2 * (jnp.roll(psi, 2, axis=0) + jnp.roll(psi, -2, axis=0))
-    lap += c1 * (jnp.roll(psi, 1, axis=1) + jnp.roll(psi, -1, axis=1))
-    lap += c2 * (jnp.roll(psi, 2, axis=1) + jnp.roll(psi, -2, axis=1))
-    lap += c1 * (jnp.roll(psi, 1, axis=2) + jnp.roll(psi, -1, axis=2))
-    lap += c2 * (jnp.roll(psi, 2, axis=2) + jnp.roll(psi, -2, axis=2))
+    lap += c1 * (shift_array(psi, 1, 0) + shift_array(psi, -1, 0))
+    lap += c2 * (shift_array(psi, 2, 0) + shift_array(psi, -2, 0))
+    lap += c1 * (shift_array(psi, 1, 1) + shift_array(psi, -1, 1))
+    lap += c2 * (shift_array(psi, 2, 1) + shift_array(psi, -2, 1))
+    lap += c1 * (shift_array(psi, 1, 2) + shift_array(psi, -1, 2))
+    lap += c2 * (shift_array(psi, 2, 2) + shift_array(psi, -2, 2))
     if mask is not None: lap = lap * mask
     return lap
 

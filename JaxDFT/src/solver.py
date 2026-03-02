@@ -62,27 +62,24 @@ def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100
 
 @jax.jit
 def solve_poisson(rho, box_size):
-    """Solve the Poisson equation with an FFT-based spectral method.
-
-    The FFT implies periodic boundary conditions on the simulation cell.
-
-    Args:
-        rho: Electron density on the grid, shape (nx, ny, nz), in Bohr^-3.
-        box_size: Simulation box lengths [Lx, Ly, Lz] in Bohr.
-
-    Returns:
-        Hartree potential on the grid, in Hartree.
-    """
     nx, ny, nz = rho.shape
-    kx = 2.0 * jnp.pi * jnp.fft.fftfreq(nx, d=box_size[0] / (nx - 1))
-    ky = 2.0 * jnp.pi * jnp.fft.fftfreq(ny, d=box_size[1] / (ny - 1))
-    kz = 2.0 * jnp.pi * jnp.fft.fftfreq(nz, d=box_size[2] / (nz - 1))
-    KX, KY, KZ = jnp.meshgrid(kx, ky, kz, indexing="ij")
-    k2 = KX * KX + KY * KY + KZ * KZ
-    rho_k = jnp.fft.fftn(rho)
-    v_k = 4.0 * jnp.pi * rho_k / jnp.where(k2 > 0, k2, 1.0)
-    v_k = v_k.at[0, 0, 0].set(0.0)
-    v = jnp.fft.ifftn(v_k).real
+    spacing = box_size[0] / (nx - 1)
+    rho_pad = jnp.pad(rho, ((0, nx), (0, ny), (0, nz)), mode='constant')
+    
+    # 修复 Bug: 移除错误的多余乘以 (2*nx)
+    x = jnp.fft.fftfreq(2*nx, d=1.0/(2*nx)) * spacing
+    y = jnp.fft.fftfreq(2*ny, d=1.0/(2*ny)) * spacing
+    z = jnp.fft.fftfreq(2*nz, d=1.0/(2*nz)) * spacing
+    KX, KY, KZ = jnp.meshgrid(x, y, z, indexing='ij')
+    R = jnp.sqrt(KX**2 + KY**2 + KZ**2)
+    
+    # 修复 Bug: R=0 处不能为 0，应该是体素自身的平均库伦势积分 (~2.38/spacing)
+    kernel = jnp.where(R > 1e-8, 1.0 / R, 2.38 / spacing)
+    
+    rho_k = jnp.fft.fftn(rho_pad)
+    kernel_k = jnp.fft.fftn(kernel)
+    v_pad = jnp.fft.ifftn(rho_k * kernel_k).real * (spacing**3)
+    v = v_pad[:nx, :ny, :nz]
     return v
 
 

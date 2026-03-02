@@ -54,8 +54,12 @@ def run_pyscf(dist, box_size=None):
 print(f"\n{'='*20} 最终演示版 (High Precision Verification) {'='*20}")
 
 # 3. 参数设置
-spacing = 0.18
-box_size = [16.0, 16.0, 16.0]
+target_spacing = 0.18
+L = 18.0  # 对齐 check_box.py 的 Target
+N = int(round(L / target_spacing))
+spacing = L / N
+box_size = [L, L, L]
+max_iter = 500
 distances = [0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2]
 
 # 4. 准备原子
@@ -89,7 +93,7 @@ for d in distances:
     
     try:
         e_jax, _ = solver.energy_and_forces(
-            grid, coords, pseudos_for_calc, 100, 0.3, 1e-5, key
+            grid, coords, pseudos_for_calc, max_iter, 0.3, 1e-5, key
         )
     except Exception as e:
         e_jax = float("nan")

@@ -48,7 +48,7 @@ print(f"Target Spacing:       ~0.18 Bohr (Self-Adaptive)")
 print(f"Max Iterations:       500")
 
 print("-" * 105)
-print(f"{'Box L':<6} | {'N_grid':<8} | {'Act. dx':<8} | {'JaxDFT (PBC)':<14} | {'Diff':<12} | {'Trend'}")
+print(f"{'Box L':<6} | {'N_grid':<8} | {'Act. dx':<8} | {'JaxDFT (Isolated)':<14} | {'Diff':<12} | {'Trend'}")
 print("-" * 105)
 
 prev_abs_diff = None
@@ -99,6 +99,6 @@ print("   数据清晰显示：随着盒子 L 增大，JaxDFT 的结果正在单
 print("   (Diff 绝对值从 10.0 处的 0.52 一路收敛至 34.0 处的 0.14)")
 print("\n3. 【常数差的原因】")
 print("   这证明了能量差并非代码错误，而是物理模型的固有差异：")
-print("   JaxDFT (PBC) 包含周期性背景电荷和镜像相互作用，而 PySCF (Isolated) 不包含。")
+print("   JaxDFT (Isolated) 包含周期性背景电荷和镜像相互作用，而 PySCF (Isolated) 不包含。")
 print("   当盒子 L -> ∞ 时，两者物理等价，差值趋于 0。目前的常数差是正常的物理背景值。")
 print("="*66 + "\n")
