@@ -6,7 +6,7 @@ finite-difference Laplacian. All quantities are in atomic units (Bohr, Hartree).
 
 import jax
 import jax.numpy as jnp
-from jax.scipy.special import erf
+from jax.scipy.special import erf, gamma
 
 
 def create_grid(spacing, box_size):
@@ -66,6 +66,16 @@ def gth_local_potential_value(r, zion, rloc, c):
     poly = c[0] + c[1]*(val**2) + c[2]*(val**4) + c[3]*(val**6)
     return v_coul + gauss * poly
 
+@jax.jit
+def get_gth_projector(r, l, i, rp):
+    """
+    计算 GTH 径向投影函数 p_i^l(r)。
+    i 是投影器索引 (1, 2, 3)，rp 是投影半径。
+    """
+    # GTH 标准归一化系数
+    t = l + (4.0 * i - 1.0) / 2.0
+    norm = jnp.sqrt(2.0) / (rp**t * jnp.sqrt(gamma(t)))
+    return norm * (r**(l + 2*i - 2)) * jnp.exp(-0.5 * (r/rp)**2)
 
 @jax.jit
 def build_local_potential(atom_coords, grid_coords, zion, rloc, c):
@@ -117,15 +127,45 @@ def laplacian_4th(psi, spacing, mask=None):
     return lap
 
 
-def apply_nonlocal(projectors, psi_flat, volume_element):
-    """Apply nonlocal pseudopotential projectors (placeholder).
 
-    Args:
-        projectors: Projector data structure.
-        psi_flat: Flattened wavefunction.
-        volume_element: Grid cell volume in Bohr^3.
-
-    Returns:
-        Nonlocal potential contribution, currently zero.
+def apply_nonlocal(grid, psi, atom_coords, pseudos):
     """
-    return 0.0
+    将非局域势投影器应用到波函数 psi 上，支持 l=0 (s) 和 l=1 (p) 通道。
+    """
+    res = jnp.zeros_like(psi)
+    dv = grid.volume_element
+    
+    for i_at in range(len(pseudos)):
+        p_at = pseudos[i_at]
+        if not p_at['projectors']: continue
+        
+        # 计算相对于原子中心的坐标和距离
+        diff = grid.coords - atom_coords[i_at]  # 形状: (nx, ny, nz, 3)
+        r = jnp.linalg.norm(diff, axis=-1)      # 形状: (nx, ny, nz)
+        r_safe = r + 1e-12                      # 防止除以零
+        
+        for ch in p_at['projectors']:
+            l = ch['l']
+            rp = ch['r']
+            h_mat = ch['h']  # 系数矩阵
+            
+            # 获取径向投影函数 p_i^l(r)
+            p_rad = get_gth_projector(r, l, 1, rp)
+            
+            if l == 0:
+                # l=0 (s-type): 角度部分是 1/sqrt(4*pi)
+                # 贡献因子 = h * <p|psi> * p / (4*pi)
+                overlap = jnp.sum(p_rad * psi) * dv
+                res = res + (h_mat[0] / (4.0 * jnp.pi)) * overlap * p_rad
+                
+            elif l == 1:
+                # l=1 (p-type): 包含 x, y, z 三个方向投影
+                # 贡献因子 = 3 * h * <p_i|psi> * p_i / (4*pi)
+                for axis in range(3):
+                    # 角度部分: r_i / r
+                    p_ang = diff[..., axis] / r_safe
+                    p_full = p_rad * p_ang
+                    overlap = jnp.sum(p_full * psi) * dv
+                    res = res + (3.0 * h_mat[0] / (4.0 * jnp.pi)) * overlap * p_full
+                    
+    return res

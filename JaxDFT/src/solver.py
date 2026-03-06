@@ -199,7 +199,11 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         def apply_h(psi_flat):
             psi = psi_flat.reshape(grid.shape)
             lap = laplacian_4th(psi, grid.spacing, grid.mask)
-            hpsi = -0.5 * lap + V_eff * psi
+            
+            # --- 新增: 非局域势贡献 ---
+            v_nonlocal = apply_nonlocal(grid, psi, coords, projectors)
+            
+            hpsi = -0.5 * lap + V_eff * psi + v_nonlocal # 加上非局域项
             return hpsi.reshape(-1)
 
         # 换回 Dense Solver
@@ -300,7 +304,16 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
 
     V_loc = build_local_potential(coords, grid.coords, zion, rloc, c)
     rho, eigvals, eigvecs, V_H, eps_xc, v_xc = scf(
-        grid, coords, n_bands, occ, V_loc, [], max_iter, mix_alpha, tolerance, key
+        grid, 
+        coords, 
+        n_bands, 
+        occ, 
+        V_loc, 
+        pseudos, 
+        max_iter, 
+        mix_alpha, 
+        tolerance, 
+        key
     )
     
     ion_e = ion_ion_energy(coords, zion)

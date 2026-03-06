@@ -31,43 +31,28 @@ def lda_exchange_vxc(rho):
 
 @jax.jit
 def lda_correlation_pz81(rho):
-    """Compute LDA correlation (PZ81) energy and potential with masking.
-
-    The constants A, B, C, D correspond to the high-density limit parameters
-    in the PZ81 form. A simple mask suppresses correlation in very low density
-    regions to avoid divergent logarithms and stabilize the SCF procedure.
-
-    Args:
-        rho: Electron density, in Bohr^-3.
-
-    Returns:
-        Tuple (ec, vc) where ec is correlation energy per particle (Hartree)
-        and vc is the correlation potential in Hartree.
-    """
-    # PZ81 Correlation (简化版，防止真空发散)
+    """实现完整的 PZ81 相关泛函及其对应的势能。"""
     rho = jnp.clip(rho, 1e-15, None)
     rs = (3.0 / (4.0 * jnp.pi * rho)) ** (1.0 / 3.0)
-    
-    # 高密度极限参数
-    A = 0.0311
-    B = -0.048
-    C = 0.0020
-    D = -0.0116
-    
-    # 简单近似: 当 rs 很大(真空)时，能量趋于0
-    # 这里为了保证数学连贯性，我们返回一个不会发散的值
-    # 实际上，在真空区 ec*rho 会自动归零
-    
-    ln_rs = jnp.log(rs + 1e-12) # 防止 log(0)
-    ec = A * ln_rs + B + C * rs * ln_rs + D
-    
-    # 简单的遮蔽：如果 rs > 10 (低密度)，强行衰减
-    # 这不是物理精确的 PZ81 低密度公式，但足以防止 NaN
-    mask = jnp.where(rs > 10.0, 0.0, 1.0)
-    ec = ec * mask
-    
-    # 势能 vc 我们暂时设为与 ec 相等 (LDA 近似)
-    return ec, ec
+
+    # --- 情况 1: 高密度极限 (rs < 1) ---
+    A, B, C, D = 0.0311, -0.048, 0.0020, -0.0116
+    ec_high = A * jnp.log(rs) + B + C * rs * jnp.log(rs) + D * rs
+    # 对应的势能项 rho * d(ec)/d(rho) = - (rs/3) * d(ec)/d(rs)
+    vc_high = ec_high - (A/3.0 + (C/3.0)*rs*jnp.log(rs) + (C/3.0)*rs + (D/3.0)*rs)
+
+    # --- 情况 2: 低密度区域 (rs >= 1) ---
+    gamma, beta1, beta2 = -0.1423, 1.0529, 0.3334
+    denom = 1.0 + beta1 * jnp.sqrt(rs) + beta2 * rs
+    ec_low = gamma / denom
+    # 对应的势能项
+    vc_low = ec_low * (1.0 + (7.0/6.0)*beta1*jnp.sqrt(rs) + (4.0/3.0)*beta2*rs) / denom
+
+    # 根据 rs 的值进行平滑选择
+    ec = jnp.where(rs < 1.0, ec_high, ec_low)
+    vc = jnp.where(rs < 1.0, vc_high, vc_low)
+
+    return ec, vc
 
 
 @jax.jit
