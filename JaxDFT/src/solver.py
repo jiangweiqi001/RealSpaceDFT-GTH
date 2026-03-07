@@ -13,14 +13,15 @@ from .hamiltonian import laplacian_4th, apply_nonlocal, build_local_potential
 
 
 def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100, tol=1e-4):
-    """Iterative solver using Safe Gradient Descent.
-    Uses a small step size to prevent divergence on fine grids.
-    """
+    """Iterative solver using Safe Gradient Descent with Rayleigh-Ritz."""
     key = jax.random.PRNGKey(42)
+    
+    # 【修复1】：防止 x_init 为全0矩阵导致 QR 分解产生边缘奇异函数
     if x_init is None:
         X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
     else:
-        X = x_init
+        # 加入微小噪声打破对称性，避免全0输入直接摧毁波函数
+        X = x_init + jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32) * 1e-6
 
     # 初始正交化
     X = jnp.linalg.qr(X)[0]
@@ -31,15 +32,19 @@ def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100
         # 1. Apply H
         HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
         
-        # 2. Rayleigh Quotient
-        E = jnp.sum(X * HX, axis=0)
+        # --- 【修复2】：核心的 Rayleigh-Ritz 子空间对角化 ---
+        # 这里强制将波函数在当前子空间内解耦，这是多能带体系收敛的绝对关键！
+        H_sub = X.T @ HX
+        E_sub, V_sub = jnp.linalg.eigh(H_sub)
+        X = X @ V_sub
+        HX = HX @ V_sub
+        E = E_sub
+        # --------------------------------------------------
         
         # 3. Residual
         R = HX - X * E[None, :]
         
         # 4. Update with SAFE step size
-        # Grid spacing 0.22 => E_max ~ 250 Ha. Safe alpha < 2/250 = 0.008.
-        # We use 0.005 to be ultra-safe.
         alpha = 0.002 
         X_new = X - alpha * R
         
@@ -207,7 +212,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             return hpsi.reshape(-1)
 
         # 换回 Dense Solver
-        eigvals, eigvecs = solve_orbitals_lobpcg(apply_h, n_grid, n_bands, x_init=eigvecs0)
+        eigvals, eigvecs = solve_orbitals_lobpcg(apply_h, n_grid, n_bands, x_init=eigvecs0, max_iter=15)
         
         # 归一化
         norm = jnp.sqrt(jnp.sum(eigvecs**2, axis=0) * volume_element)

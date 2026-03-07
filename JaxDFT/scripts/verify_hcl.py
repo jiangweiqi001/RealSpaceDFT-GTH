@@ -35,8 +35,8 @@ def run_pyscf(dist):
 print(f"\n{'='*20} HCl 分子验证 (High Precision) {'='*20}")
 
 # 3. 计算参数
-target_spacing = 0.18
-L = 20.0  # 增大盒子以容纳 Cl 原子
+target_spacing = 0.15
+L = 16.0  # 增大盒子以容纳 Cl 原子
 N = int(round(L / target_spacing))
 spacing = L / N
 box_size = [L, L, L]

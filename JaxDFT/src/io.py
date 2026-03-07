@@ -197,20 +197,35 @@ def parse_gth_text(text):
     n_channels = int(lines[idx].split()[0])
     idx += 1
     l_cur = 0
+    
     for _ in range(n_channels):
         tokens = lines[idx].split()
-        r = float(tokens[0])
-        n_proj = int(tokens[1])
+        # 兼容带有和不带有角动量 l 的格式
+        if len(tokens) == 3:
+            l_val = int(tokens[0])
+            r = float(tokens[1])
+            n_proj = int(tokens[2])
+            l_cur = l_val  # 如果文件显式提供了角动量l，就用文件里的
+        else:
+            r = float(tokens[0])
+            n_proj = int(tokens[1])
         idx += 1
-        hvals = []
-        for _ in range(n_proj):
+        
+        # --- 核心修改：读取上三角/全矩阵格式的 h 系数 ---
+        h_mat = np.zeros((n_proj, n_proj), dtype=float)
+        for i in range(n_proj):
             toks = lines[idx].split()
-            hvals.append(float(toks[0]))
+            # CP2K 格式每行仅包含上三角剩余的部分
+            for j_offset in range(len(toks)):
+                val = float(toks[j_offset])
+                h_mat[i, i + j_offset] = val
+                h_mat[i + j_offset, i] = val  # 利用对称性填充下三角
             idx += 1
-        h = np.array(hvals, dtype=float)
+            
         poly = np.arange(n_proj, dtype=int)
-        projectors.append(GTHProjector(l=l_cur, r=r, h=h, poly=poly))
+        projectors.append(GTHProjector(l=l_cur, r=r, h=h_mat, poly=poly))
         l_cur += 1
+        
     return GTHPP(symbol=symbol, q=q, local=local, projectors=projectors)
 
 

@@ -130,7 +130,8 @@ def laplacian_4th(psi, spacing, mask=None):
 
 def apply_nonlocal(grid, psi, atom_coords, pseudos):
     """
-    将非局域势投影器应用到波函数 psi 上，支持 l=0 (s) 和 l=1 (p) 通道。
+    将非局域势投影器应用到波函数 psi 上，支持 l=0 (s) 和 l=1 (p) 通道，
+    并支持多投影器 (n_proj >= 1) 的全矩阵计算。
     """
     res = jnp.zeros_like(psi)
     dv = grid.volume_element
@@ -147,25 +148,41 @@ def apply_nonlocal(grid, psi, atom_coords, pseudos):
         for ch in p_at['projectors']:
             l = ch['l']
             rp = ch['r']
-            h_mat = ch['h']  # 系数矩阵
+            h_mat = jnp.array(ch['h']) 
             
-            # 获取径向投影函数 p_i^l(r)
-            p_rad = get_gth_projector(r, l, 1, rp)
-            
-            if l == 0:
-                # l=0 (s-type): 角度部分是 1/sqrt(4*pi)
-                # 贡献因子 = h * <p|psi> * p / (4*pi)
-                overlap = jnp.sum(p_rad * psi) * dv
-                res = res + (h_mat[0] / (4.0 * jnp.pi)) * overlap * p_rad
+            # 兼容旧的一维数组，如果是 1D，转成对角阵
+            if h_mat.ndim == 1:
+                h_mat = jnp.diag(h_mat)
                 
-            elif l == 1:
-                # l=1 (p-type): 包含 x, y, z 三个方向投影
-                # 贡献因子 = 3 * h * <p_i|psi> * p_i / (4*pi)
-                for axis in range(3):
-                    # 角度部分: r_i / r
-                    p_ang = diff[..., axis] / r_safe
-                    p_full = p_rad * p_ang
-                    overlap = jnp.sum(p_full * psi) * dv
-                    res = res + (3.0 * h_mat[0] / (4.0 * jnp.pi)) * overlap * p_full
+            n_proj = h_mat.shape[0]
+            
+            # 遍历 i 和 j (从 1 到 n_proj)
+            for i in range(1, n_proj + 1):
+                p_i_rad = get_gth_projector(r, l, i, rp)
+                
+                for j in range(1, n_proj + 1):
+                    h_ij = h_mat[i-1, j-1]
                     
+                    # --- 核心修复：移除会导致 JAX Tracer 报错的 if 判断 ---
+                    # 直接计算，当 h_ij = 0 时对 res 的最终贡献自然是 0
+                    
+                    p_j_rad = get_gth_projector(r, l, j, rp)
+                    
+                    if l == 0:
+                        # l=0 (s-type)
+                        overlap = jnp.sum(p_j_rad * psi) * dv
+                        res = res + (h_ij / (4.0 * jnp.pi)) * overlap * p_i_rad
+                        
+                    elif l == 1:
+                        # l=1 (p-type): 包含 x, y, z 三个方向投影
+                        for axis in range(3):
+                            p_j_ang = diff[..., axis] / r_safe
+                            p_j_full = p_j_rad * p_j_ang
+                            
+                            p_i_ang = diff[..., axis] / r_safe
+                            p_i_full = p_i_rad * p_i_ang
+                            
+                            overlap = jnp.sum(p_j_full * psi) * dv
+                            res = res + (3.0 * h_ij / (4.0 * jnp.pi)) * overlap * p_i_full
+                            
     return res
