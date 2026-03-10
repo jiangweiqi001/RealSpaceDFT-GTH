@@ -36,7 +36,7 @@ print(f"\n{'='*20} HCl 分子验证 (High Precision) {'='*20}")
 
 # 3. 计算参数
 target_spacing = 0.15
-L = 16.0  # 增大盒子以容纳 Cl 原子
+L = 20.0  # 增大盒子以容纳 Cl 原子
 N = int(round(L / target_spacing))
 spacing = L / N
 box_size = [L, L, L]
@@ -62,10 +62,22 @@ print("-" * 75)
 
 for d in distances:
     coords = jnp.array([[0.0, 0.0, 0.0], [0.0, 0.0, d]])
+    if d >= 3.6:
+        # 极限解离区：电荷极易震荡，步长必须极小，耐心拉满
+        current_alpha = 0.05
+        current_max_iter = 1200
+    elif d >= 2.6:
+        # 危险区：把安全门槛从 3.0 提前到 2.6，兜住 2.8 这个点
+        current_alpha = 0.1
+        current_max_iter = 800
+    else:
+        # 安全区：继续全速狂奔
+        current_alpha = 0.3
+        current_max_iter = 400
     
     try:
         e_jax, _ = solver.energy_and_forces(
-            grid, coords, pseudos_for_calc, 500, 0.3, 1e-5, key
+            grid, coords, pseudos_for_calc, current_max_iter, current_alpha, 1e-5, key
         )
     except Exception as e:
         print(f"Error at d={d}: {e}")

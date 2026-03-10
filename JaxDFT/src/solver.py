@@ -8,7 +8,7 @@ the Kohn-Sham eigenproblem, and mixes the density until convergence.
 import jax
 import jax.numpy as jnp
 from .functional import lda_xc
-from .hamiltonian import laplacian_4th, apply_nonlocal, build_local_potential
+from .hamiltonian import laplacian_4th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
 
 
 
@@ -45,7 +45,7 @@ def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100
         R = HX - X * E[None, :]
         
         # 4. Update with SAFE step size
-        alpha = 0.002 
+        alpha = 0.004 
         X_new = X - alpha * R
         
         # 5. Re-orthogonalize (Critical for stability)
@@ -65,24 +65,26 @@ def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100
 
 
 
-@jax.jit
-def solve_poisson(rho, box_size):
-    nx, ny, nz = rho.shape
-    spacing = box_size[0] / (nx - 1)
-    rho_pad = jnp.pad(rho, ((0, nx), (0, ny), (0, nz)), mode='constant')
-    
-    # 修复 Bug: 移除错误的多余乘以 (2*nx)
+# 新增：在 SCF 外面只算一次的核函数 FFT
+def precompute_poisson_kernel(grid_shape, spacing):
+    nx, ny, nz = grid_shape
     x = jnp.fft.fftfreq(2*nx, d=1.0/(2*nx)) * spacing
     y = jnp.fft.fftfreq(2*ny, d=1.0/(2*ny)) * spacing
     z = jnp.fft.fftfreq(2*nz, d=1.0/(2*nz)) * spacing
     KX, KY, KZ = jnp.meshgrid(x, y, z, indexing='ij')
     R = jnp.sqrt(KX**2 + KY**2 + KZ**2)
     
-    # 修复 Bug: R=0 处不能为 0，应该是体素自身的平均库伦势积分 (~2.38/spacing)
     kernel = jnp.where(R > 1e-8, 1.0 / R, 2.38 / spacing)
+    return jnp.fft.fftn(kernel)
+
+# 修改：SCF 内循环每次只对密度做 FFT，直接使用算好的 kernel_k
+@jax.jit
+def solve_poisson(rho, kernel_k, spacing):
+    nx, ny, nz = rho.shape
+    rho_pad = jnp.pad(rho, ((0, nx), (0, ny), (0, nz)), mode='constant')
     
     rho_k = jnp.fft.fftn(rho_pad)
-    kernel_k = jnp.fft.fftn(kernel)
+    # 直接相乘做一次 IFFT，省去了重新计算 kernel_k 的时间
     v_pad = jnp.fft.ifftn(rho_k * kernel_k).real * (spacing**3)
     v = v_pad[:nx, :ny, :nz]
     return v
@@ -180,7 +182,8 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
 
     f_hist = jnp.zeros((5, rho.size), dtype=jnp.float32)
     n_grid = rho.size
-    
+    kernel_k = precompute_poisson_kernel(grid.shape, grid.spacing)
+    proj_data = precompute_projectors(grid, coords, projectors)
     # 占位符
     eigvals0 = jnp.zeros((n_bands,), dtype=jnp.float32)
     eigvecs0 = jnp.zeros((n_grid, n_bands), dtype=jnp.float32)
@@ -197,7 +200,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     def body(state):
         i, rho_cur, f_hist_cur, diff, _, eigvecs0, _, _, _ = state
         rho_cur = jnp.clip(rho_cur, 1e-12, None)
-        V_H = solve_poisson(rho_cur, grid.box_size)
+        V_H = solve_poisson(rho_cur, kernel_k, grid.spacing)
         eps_xc, v_xc = lda_xc(rho_cur)
         V_eff = V_loc + V_H + v_xc
 
@@ -205,14 +208,17 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             psi = psi_flat.reshape(grid.shape)
             lap = laplacian_4th(psi, grid.spacing, grid.mask)
             
-            # --- 新增: 非局域势贡献 ---
-            v_nonlocal = apply_nonlocal(grid, psi, coords, projectors)
+            if proj_data is not None:
+                P_i, P_j, coeffs = proj_data
+                v_nonlocal = apply_nonlocal_precomputed(psi, P_i, P_j, coeffs, grid.volume_element)
+            else:
+                v_nonlocal = jnp.zeros_like(psi)
             
             hpsi = -0.5 * lap + V_eff * psi + v_nonlocal # 加上非局域项
             return hpsi.reshape(-1)
 
         # 换回 Dense Solver
-        eigvals, eigvecs = solve_orbitals_lobpcg(apply_h, n_grid, n_bands, x_init=eigvecs0, max_iter=15)
+        eigvals, eigvecs = solve_orbitals_lobpcg(apply_h, n_grid, n_bands, x_init=eigvecs0, max_iter=30)
         
         # 归一化
         norm = jnp.sqrt(jnp.sum(eigvecs**2, axis=0) * volume_element)

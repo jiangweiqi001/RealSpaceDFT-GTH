@@ -101,14 +101,30 @@ def build_local_potential(atom_coords, grid_coords, zion, rloc, c):
 
 
 def shift_array(arr, shift, axis):
-    rolled = jnp.roll(arr, shift, axis=axis)
-    if axis == 0:
-        rolled = jnp.where(jnp.arange(arr.shape[0])[:, None, None] < shift if shift > 0 else jnp.arange(arr.shape[0])[:, None, None] >= arr.shape[0] + shift, 0.0, rolled)
-    elif axis == 1:
-        rolled = jnp.where(jnp.arange(arr.shape[1])[None, :, None] < shift if shift > 0 else jnp.arange(arr.shape[1])[None, :, None] >= arr.shape[1] + shift, 0.0, rolled)
-    elif axis == 2:
-        rolled = jnp.where(jnp.arange(arr.shape[2])[None, None, :] < shift if shift > 0 else jnp.arange(arr.shape[2])[None, None, :] >= arr.shape[2] + shift, 0.0, rolled)
-    return rolled
+    """
+    通过 Pad 和 Slice 实现数组平移，避免 roll + where 带来的巨大内存带宽开销。
+    移入边缘的部分自动补 0 (Dirichlet 边界)。
+    """
+    if shift == 0:
+        return arr
+        
+    # 初始化填充配置，针对 3D 数组
+    pad_width = [(0, 0), (0, 0), (0, 0)]
+    slices = [slice(None), slice(None), slice(None)]
+    
+    if shift > 0:
+        # 正向移动：在头部补 0，并切掉尾部超出的部分
+        pad_width[axis] = (shift, 0)
+        padded = jnp.pad(arr, pad_width, mode='constant', constant_values=0.0)
+        slices[axis] = slice(0, arr.shape[axis])
+        return padded[tuple(slices)]
+    else:
+        # 反向移动：在尾部补 0，并切掉头部超出的部分
+        abs_shift = -shift
+        pad_width[axis] = (0, abs_shift)
+        padded = jnp.pad(arr, pad_width, mode='constant', constant_values=0.0)
+        slices[axis] = slice(abs_shift, None)
+        return padded[tuple(slices)]
 
 @jax.jit
 def laplacian_4th(psi, spacing, mask=None):
@@ -128,61 +144,68 @@ def laplacian_4th(psi, spacing, mask=None):
 
 
 
-def apply_nonlocal(grid, psi, atom_coords, pseudos):
+def precompute_projectors(grid, atom_coords, pseudos):
     """
-    将非局域势投影器应用到波函数 psi 上，支持 l=0 (s) 和 l=1 (p) 通道，
-    并支持多投影器 (n_proj >= 1) 的全矩阵计算。
+    在 SCF 外预先计算所有的非局域势投影器在实空间网格上的值。
+    将其打包成 4D 张量，供 JAX 进行极速张量批处理。
     """
-    res = jnp.zeros_like(psi)
-    dv = grid.volume_element
+    p_i_list = []
+    p_j_list = []
+    coeff_list = []
     
     for i_at in range(len(pseudos)):
         p_at = pseudos[i_at]
         if not p_at['projectors']: continue
         
-        # 计算相对于原子中心的坐标和距离
-        diff = grid.coords - atom_coords[i_at]  # 形状: (nx, ny, nz, 3)
-        r = jnp.linalg.norm(diff, axis=-1)      # 形状: (nx, ny, nz)
-        r_safe = r + 1e-12                      # 防止除以零
+        diff = grid.coords - atom_coords[i_at]  # (nx, ny, nz, 3)
+        r = jnp.linalg.norm(diff, axis=-1)      # (nx, ny, nz)
+        r_safe = r + 1e-12
         
         for ch in p_at['projectors']:
             l = ch['l']
             rp = ch['r']
             h_mat = jnp.array(ch['h']) 
-            
-            # 兼容旧的一维数组，如果是 1D，转成对角阵
             if h_mat.ndim == 1:
                 h_mat = jnp.diag(h_mat)
-                
             n_proj = h_mat.shape[0]
             
-            # 遍历 i 和 j (从 1 到 n_proj)
             for i in range(1, n_proj + 1):
                 p_i_rad = get_gth_projector(r, l, i, rp)
-                
                 for j in range(1, n_proj + 1):
                     h_ij = h_mat[i-1, j-1]
-                    
-                    # --- 核心修复：移除会导致 JAX Tracer 报错的 if 判断 ---
-                    # 直接计算，当 h_ij = 0 时对 res 的最终贡献自然是 0
+                    if jnp.abs(h_ij) < 1e-10: 
+                        continue # 忽略为 0 的通道
                     
                     p_j_rad = get_gth_projector(r, l, j, rp)
                     
                     if l == 0:
-                        # l=0 (s-type)
-                        overlap = jnp.sum(p_j_rad * psi) * dv
-                        res = res + (h_ij / (4.0 * jnp.pi)) * overlap * p_i_rad
-                        
+                        p_i_list.append(p_i_rad)
+                        p_j_list.append(p_j_rad)
+                        coeff_list.append(h_ij / (4.0 * jnp.pi))
                     elif l == 1:
-                        # l=1 (p-type): 包含 x, y, z 三个方向投影
-                        for axis in range(3):
-                            p_j_ang = diff[..., axis] / r_safe
-                            p_j_full = p_j_rad * p_j_ang
+                        for axis in range(3): # p型势包含三个空间方向
+                            p_i_full = p_i_rad * (diff[..., axis] / r_safe)
+                            p_j_full = p_j_rad * (diff[..., axis] / r_safe)
+                            p_i_list.append(p_i_full)
+                            p_j_list.append(p_j_full)
+                            coeff_list.append(3.0 * h_ij / (4.0 * jnp.pi))
                             
-                            p_i_ang = diff[..., axis] / r_safe
-                            p_i_full = p_i_rad * p_i_ang
-                            
-                            overlap = jnp.sum(p_j_full * psi) * dv
-                            res = res + (3.0 * h_ij / (4.0 * jnp.pi)) * overlap * p_i_full
-                            
-    return res
+    if not p_i_list:
+        return None
+        
+    P_i = jnp.stack(p_i_list, axis=0) # 形状: (通道数, nx, ny, nz)
+    P_j = jnp.stack(p_j_list, axis=0)
+    coeffs = jnp.array(coeff_list)    # 形状: (通道数,)
+    return P_i, P_j, coeffs
+
+@jax.jit
+def apply_nonlocal_precomputed(psi, P_i, P_j, coeffs, dv):
+    """
+    利用预计算的投影器张量，进行极速批处理点乘，彻底去除高斯指数计算。
+    """
+    # 计算所有通道的 overlap，并做体积分 (axis 1,2,3 是空间维度)
+    overlap = jnp.sum(P_j * psi[None, ...], axis=(1, 2, 3)) * dv
+    
+    weight = coeffs * overlap
+    # 结果累加
+    return jnp.sum(weight[:, None, None, None] * P_i, axis=0)
