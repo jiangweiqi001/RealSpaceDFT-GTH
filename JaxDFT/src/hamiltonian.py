@@ -7,7 +7,7 @@ finite-difference Laplacian. All quantities are in atomic units (Bohr, Hartree).
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import erf, gamma
-
+from jax.scipy.signal import convolve
 
 def create_grid(spacing, box_size):
     """Create a uniform real-space grid for DFT calculations.
@@ -100,46 +100,49 @@ def build_local_potential(atom_coords, grid_coords, zion, rloc, c):
     return V_total
 
 
-def shift_array(arr, shift, axis):
-    """
-    通过 Pad 和 Slice 实现数组平移，避免 roll + where 带来的巨大内存带宽开销。
-    移入边缘的部分自动补 0 (Dirichlet 边界)。
-    """
-    if shift == 0:
-        return arr
-        
-    # 初始化填充配置，针对 3D 数组
-    pad_width = [(0, 0), (0, 0), (0, 0)]
-    slices = [slice(None), slice(None), slice(None)]
-    
-    if shift > 0:
-        # 正向移动：在头部补 0，并切掉尾部超出的部分
-        pad_width[axis] = (shift, 0)
-        padded = jnp.pad(arr, pad_width, mode='constant', constant_values=0.0)
-        slices[axis] = slice(0, arr.shape[axis])
-        return padded[tuple(slices)]
-    else:
-        # 反向移动：在尾部补 0，并切掉头部超出的部分
-        abs_shift = -shift
-        pad_width[axis] = (0, abs_shift)
-        padded = jnp.pad(arr, pad_width, mode='constant', constant_values=0.0)
-        slices[axis] = slice(abs_shift, None)
-        return padded[tuple(slices)]
 
 @jax.jit
 def laplacian_4th(psi, spacing, mask=None):
+    """
+    使用 3D 卷积计算 4阶有限差分拉普拉斯算符。
+    利用 mode='same' 自动实现零填充（严格的 Dirichlet 边界条件）。
+    """
     h2 = spacing * spacing
     c0 = -2.5 / h2
     c1 = (4.0/3.0) / h2
     c2 = (-1.0/12.0) / h2
-    lap = 3.0 * c0 * psi
-    lap += c1 * (shift_array(psi, 1, 0) + shift_array(psi, -1, 0))
-    lap += c2 * (shift_array(psi, 2, 0) + shift_array(psi, -2, 0))
-    lap += c1 * (shift_array(psi, 1, 1) + shift_array(psi, -1, 1))
-    lap += c2 * (shift_array(psi, 2, 1) + shift_array(psi, -2, 1))
-    lap += c1 * (shift_array(psi, 1, 2) + shift_array(psi, -1, 2))
-    lap += c2 * (shift_array(psi, 2, 2) + shift_array(psi, -2, 2))
-    if mask is not None: lap = lap * mask
+    
+    # 1. 构造 5x5x5 的拉普拉斯卷积核
+    # 绝大部分权重为 0，只有中心十字架上有值
+    kernel = jnp.zeros((5, 5, 5), dtype=psi.dtype)
+    
+    # 中心点 (x, y, z)
+    kernel = kernel.at[2, 2, 2].set(3.0 * c0)
+    
+    # 第一层近邻 (距离 1，系数 c1)
+    kernel = kernel.at[1, 2, 2].set(c1)
+    kernel = kernel.at[3, 2, 2].set(c1)
+    kernel = kernel.at[2, 1, 2].set(c1)
+    kernel = kernel.at[2, 3, 2].set(c1)
+    kernel = kernel.at[2, 2, 1].set(c1)
+    kernel = kernel.at[2, 2, 3].set(c1)
+    
+    # 第二层近邻 (距离 2，系数 c2)
+    kernel = kernel.at[0, 2, 2].set(c2)
+    kernel = kernel.at[4, 2, 2].set(c2)
+    kernel = kernel.at[2, 0, 2].set(c2)
+    kernel = kernel.at[2, 4, 2].set(c2)
+    kernel = kernel.at[2, 2, 0].set(c2)
+    kernel = kernel.at[2, 2, 4].set(c2)
+    
+    # 2. 执行 3D 卷积
+    # mode='same' 会在 psi 边缘自动补零，计算后保持原 shape
+    lap = convolve(psi, kernel, mode='same')
+    
+    # 3. 施加掩膜 (如有)
+    if mask is not None: 
+        lap = lap * mask
+        
     return lap
 
 

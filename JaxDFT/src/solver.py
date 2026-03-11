@@ -11,61 +11,64 @@ from .functional import lda_xc
 from .hamiltonian import laplacian_4th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
 
 
-
 def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100, tol=1e-4):
-    """Iterative solver using Safe Gradient Descent with Rayleigh-Ritz."""
+    """Iterative solver using Subspace Expansion (Simplified LOBPCG/Davidson)."""
     key = jax.random.PRNGKey(42)
     
-    # 【修复1】：防止 x_init 为全0矩阵导致 QR 分解产生边缘奇异函数
     if x_init is None:
         X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
     else:
-        # 加入微小噪声打破对称性，避免全0输入直接摧毁波函数
         X = x_init + jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32) * 1e-6
 
-    # 初始正交化
+    # 1. 初始正交化，并**提前算出初始的 HX** (极其重要的优化，省去一半计算量)
     X = jnp.linalg.qr(X)[0]
+    HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
 
     def body_fun(state):
-        i, X, E = state
+        i, X, HX, E = state
         
-        # 1. Apply H
-        HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
-        
-        # --- 【修复2】：核心的 Rayleigh-Ritz 子空间对角化 ---
-        # 这里强制将波函数在当前子空间内解耦，这是多能带体系收敛的绝对关键！
+        # 1. 当前子空间解耦 (Rayleigh-Ritz)
         H_sub = X.T @ HX
-        E_sub, V_sub = jnp.linalg.eigh(H_sub)
+        E, V_sub = jnp.linalg.eigh(H_sub)
         X = X @ V_sub
         HX = HX @ V_sub
-        E = E_sub
-        # --------------------------------------------------
         
-        # 3. Residual
+        # 2. 计算残差梯度 R
         R = HX - X * E[None, :]
         
-        # 4. Update with SAFE step size
-        alpha = 0.004 
-        X_new = X - alpha * R
+        # 3. 将残差 R 与当前的 X 正交化 (Gram-Schmidt)
+        R = R - X @ (X.T @ R)
         
-        # 5. Re-orthogonalize (Critical for stability)
-        X_new = jnp.linalg.qr(X_new)[0]
+        # 4. 对 R 进行内部正交归一化，得到纯净的扩展基
+        R = jnp.linalg.qr(R)[0]
         
-        return i + 1, X_new, E
+        # 5. 【核心】只对新的残差基 R 作用哈密顿量
+        HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R)
+        
+        # 6. 拼接构成 2 倍大小的扩展子空间 Z = [X, R]
+        Z = jnp.concatenate([X, R], axis=1)
+        HZ = jnp.concatenate([HX, HR], axis=1)
+        
+        # 7. 在 2N 维的子空间内进行极速对角化 (矩阵只有 2*n_bands 大小)
+        H_Z = Z.T @ HZ
+        E_Z, V_Z = jnp.linalg.eigh(H_Z)
+        
+        # 8. 提取能量最低的前 n_bands 个本征向量，作为完美更新后的波函数
+        X_new = Z @ V_Z[:, :n_bands]
+        HX_new = HZ @ V_Z[:, :n_bands]
+        
+        return i + 1, X_new, HX_new, E_Z[:n_bands]
 
     final_state = jax.lax.while_loop(
         lambda s: s[0] < max_iter,
         body_fun,
-        (0, X, jnp.zeros(n_bands))
+        (0, X, HX, jnp.zeros(n_bands)) # 注意这里 State 多传了一个 HX
     )
     
-    _, X_final, E_final = final_state
+    _, X_final, _, E_final = final_state
     return E_final, X_final
 
 
-
-
-# 新增：在 SCF 外面只算一次的核函数 FFT
 def precompute_poisson_kernel(grid_shape, spacing):
     nx, ny, nz = grid_shape
     x = jnp.fft.fftfreq(2*nx, d=1.0/(2*nx)) * spacing
@@ -77,14 +80,12 @@ def precompute_poisson_kernel(grid_shape, spacing):
     kernel = jnp.where(R > 1e-8, 1.0 / R, 2.38 / spacing)
     return jnp.fft.fftn(kernel)
 
-# 修改：SCF 内循环每次只对密度做 FFT，直接使用算好的 kernel_k
 @jax.jit
 def solve_poisson(rho, kernel_k, spacing):
     nx, ny, nz = rho.shape
     rho_pad = jnp.pad(rho, ((0, nx), (0, ny), (0, nz)), mode='constant')
     
     rho_k = jnp.fft.fftn(rho_pad)
-    # 直接相乘做一次 IFFT，省去了重新计算 kernel_k 的时间
     v_pad = jnp.fft.ifftn(rho_k * kernel_k).real * (spacing**3)
     v = v_pad[:nx, :ny, :nz]
     return v
@@ -198,9 +199,12 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         return jnp.logical_and(i < max_iter, diff > tolerance)
 
     def body(state):
-        i, rho_cur, f_hist_cur, diff, _, eigvecs0, _, _, _ = state
+        i, rho_cur, f_hist_cur, diff, _, eigvecs0, V_H_prev, _, _ = state
         rho_cur = jnp.clip(rho_cur, 1e-12, None)
+        
+
         V_H = solve_poisson(rho_cur, kernel_k, grid.spacing)
+        
         eps_xc, v_xc = lda_xc(rho_cur)
         V_eff = V_loc + V_H + v_xc
 
