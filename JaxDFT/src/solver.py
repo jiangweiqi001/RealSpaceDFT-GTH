@@ -11,9 +11,21 @@ from .functional import lda_xc
 from .hamiltonian import laplacian_4th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
 
 
-def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100, tol=1e-4):
-    """Iterative solver using Subspace Expansion (Simplified LOBPCG/Davidson)."""
-    key = jax.random.PRNGKey(42)
+def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100, tol=1e-4, key=None):
+    """Iterative solver using Subspace Expansion (Simplified LOBPCG/Davidson).
+
+    Args:
+        apply_h_fn: Linear operator that applies H to a flattened wavefunction.
+        n_grid: Total number of grid points.
+        n_bands: Number of orbitals to solve for.
+        x_init: Optional initial orbital guess with shape (n_grid, n_bands).
+        max_iter: Maximum subspace iterations.
+        tol: Reserved convergence tolerance parameter.
+        key: Optional JAX PRNG key used to seed orbital initialization. If not
+            provided, a fixed key is used for backwards-compatible behavior.
+    """
+    if key is None:
+        key = jax.random.PRNGKey(42)
     
     if x_init is None:
         X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
@@ -165,13 +177,15 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         max_iter: Maximum SCF iterations.
         mix_alpha: Anderson mixing strength.
         tolerance: Convergence threshold for density change.
-        key: JAX PRNG key (kept for API consistency).
+        key: Base JAX PRNG key used to seed orbital initialization.
 
     Returns:
         Tuple (rho, eigvals, eigvecs, V_H, eps_xc, v_xc) where energies are in
         Hartree and densities in Bohr^-3.
     """
     coords = jnp.asarray(coords, dtype=jnp.float32)
+    if key is None:
+        key = jax.random.PRNGKey(42)
     volume_element = grid.volume_element
     
     # 初始密度
@@ -222,7 +236,15 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             return hpsi.reshape(-1)
 
         # 换回 Dense Solver
-        eigvals, eigvecs = solve_orbitals_lobpcg(apply_h, n_grid, n_bands, x_init=eigvecs0, max_iter=30)
+        iter_key = jax.random.fold_in(key, i)
+        eigvals, eigvecs = solve_orbitals_lobpcg(
+            apply_h,
+            n_grid,
+            n_bands,
+            x_init=eigvecs0,
+            max_iter=30,
+            key=iter_key,
+        )
         
         # 归一化
         norm = jnp.sqrt(jnp.sum(eigvecs**2, axis=0) * volume_element)
@@ -298,7 +320,7 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         max_iter: Maximum SCF iterations.
         mix_alpha: Anderson mixing strength.
         tolerance: Convergence threshold for density change.
-        key: JAX PRNG key.
+        key: Base JAX PRNG key used to seed the SCF orbital initialization.
 
     Returns:
         Tuple (energy, forces) where energy is in Hartree and forces are in
