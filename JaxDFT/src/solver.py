@@ -8,7 +8,7 @@ the Kohn-Sham eigenproblem, and mixes the density until convergence.
 import jax
 import jax.numpy as jnp
 from .functional import lda_xc
-from .hamiltonian import laplacian_4th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
+from .hamiltonian import laplacian_6th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
 
 
 def solve_orbitals_subspace(
@@ -256,7 +256,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
 
         def apply_h(psi_flat):
             psi = psi_flat.reshape(grid.shape)
-            lap = laplacian_4th(psi, grid.spacing, grid.mask)
+            lap = laplacian_6th(psi, grid.spacing, grid.mask)
             
             if proj_data is not None:
                 P_i, P_j, coeffs = proj_data

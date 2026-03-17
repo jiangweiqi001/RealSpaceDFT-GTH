@@ -55,7 +55,7 @@ print(f"\n{'='*20} 最终演示版 (High Precision Verification) {'='*20}")
 
 # 3. 参数设置
 target_spacing = 0.18
-L = 18.0  # 对齐 check_box.py 的 Target
+L = 18.0  
 N = int(round(L / target_spacing))
 spacing = L / N
 box_size = [L, L, L]

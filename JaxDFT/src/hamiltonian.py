@@ -178,7 +178,97 @@ def laplacian_4th(psi, spacing, mask=None):
         lap = lap * mask
     return lap
 
+@jax.jit
+def laplacian_6th(psi, spacing, mask=None):
+    """
+    6th-order finite-difference Laplacian with strict Dirichlet BC.
+    Provides significantly higher accuracy for hard pseudopotentials and 
+    steep density gradients without increasing grid resolution.
+    """
+    inv_h2 = 1.0 / (spacing * spacing)
+    # 六阶中心差分系数
+    c0 = -49.0 / 18.0 * inv_h2
+    c1 = 1.5 * inv_h2
+    c2 = -0.15 * inv_h2
+    c3 = (1.0 / 90.0) * inv_h2
 
+    # 边界需要向外 padding 3 层 0 (严格的开边界条件)
+    p = jnp.pad(psi, ((3, 3), (3, 3), (3, 3)), mode="constant")
+
+    # 中心点
+    center = p[3:-3, 3:-3, 3:-3]
+
+    # 六阶差分模板 (Stencil)
+    lap = (
+        3.0 * c0 * center
+        + c1 * (
+            p[2:-4, 3:-3, 3:-3] + p[4:-2, 3:-3, 3:-3]
+            + p[3:-3, 2:-4, 3:-3] + p[3:-3, 4:-2, 3:-3]
+            + p[3:-3, 3:-3, 2:-4] + p[3:-3, 3:-3, 4:-2]
+        )
+        + c2 * (
+            p[1:-5, 3:-3, 3:-3] + p[5:-1, 3:-3, 3:-3]
+            + p[3:-3, 1:-5, 3:-3] + p[3:-3, 5:-1, 3:-3]
+            + p[3:-3, 3:-3, 1:-5] + p[3:-3, 3:-3, 5:-1]
+        )
+        + c3 * (
+            p[0:-6, 3:-3, 3:-3] + p[6:  , 3:-3, 3:-3]
+            + p[3:-3, 0:-6, 3:-3] + p[3:-3, 6:  , 3:-3]
+            + p[3:-3, 3:-3, 0:-6] + p[3:-3, 3:-3, 6:  ]
+        )
+    )
+
+    if mask is not None:
+        lap = lap * mask
+    return lap
+
+@jax.jit
+def laplacian_8th(psi, spacing, mask=None):
+    """
+    8th-order finite-difference Laplacian with strict Dirichlet BC.
+    The ultimate accuracy for real-space grids.
+    """
+    inv_h2 = 1.0 / (spacing * spacing)
+    # 8阶中心差分系数
+    c0 = -205.0 / 72.0 * inv_h2
+    c1 = 1.6 * inv_h2           # 8/5
+    c2 = -0.2 * inv_h2          # -1/5
+    c3 = (8.0 / 315.0) * inv_h2
+    c4 = (-1.0 / 560.0) * inv_h2
+
+    # 8阶需要向外 pad 4 层
+    p = jnp.pad(psi, ((4, 4), (4, 4), (4, 4)), mode="constant")
+    
+    # 中心点
+    center = p[4:-4, 4:-4, 4:-4]
+
+    lap = (
+        3.0 * c0 * center
+        + c1 * (
+            p[3:-5, 4:-4, 4:-4] + p[5:-3, 4:-4, 4:-4]
+            + p[4:-4, 3:-5, 4:-4] + p[4:-4, 5:-3, 4:-4]
+            + p[4:-4, 4:-4, 3:-5] + p[4:-4, 4:-4, 5:-3]
+        )
+        + c2 * (
+            p[2:-6, 4:-4, 4:-4] + p[6:-2, 4:-4, 4:-4]
+            + p[4:-4, 2:-6, 4:-4] + p[4:-4, 6:-2, 4:-4]
+            + p[4:-4, 4:-4, 2:-6] + p[4:-4, 4:-4, 6:-2]
+        )
+        + c3 * (
+            p[1:-7, 4:-4, 4:-4] + p[7:-1, 4:-4, 4:-4]
+            + p[4:-4, 1:-7, 4:-4] + p[4:-4, 7:-1, 4:-4]
+            + p[4:-4, 4:-4, 1:-7] + p[4:-4, 4:-4, 7:-1]
+        )
+        + c4 * (
+            p[0:-8, 4:-4, 4:-4] + p[8:  , 4:-4, 4:-4]
+            + p[4:-4, 0:-8, 4:-4] + p[4:-4, 8:  , 4:-4]
+            + p[4:-4, 4:-4, 0:-8] + p[4:-4, 4:-4, 8:  ]
+        )
+    )
+
+    if mask is not None:
+        lap = lap * mask
+    return lap
 
 def precompute_projectors(grid, atom_coords, pseudos):
     """
