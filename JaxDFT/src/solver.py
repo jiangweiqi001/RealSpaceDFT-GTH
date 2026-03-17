@@ -11,74 +11,106 @@ from .functional import lda_xc
 from .hamiltonian import laplacian_4th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
 
 
-def solve_orbitals_lobpcg(apply_h_fn, n_grid, n_bands, x_init=None, max_iter=100, tol=1e-4, key=None):
-    """Iterative solver using Subspace Expansion (Simplified LOBPCG/Davidson).
+def solve_orbitals_subspace(
+    apply_h_fn,
+    n_grid,
+    n_bands,
+    x_init=None,
+    max_iter=100,
+    tol=1e-5,
+    key=None,
+):
+    """
+    Iterative eigensolver using block subspace expansion + Rayleigh-Ritz.
 
-    Args:
-        apply_h_fn: Linear operator that applies H to a flattened wavefunction.
-        n_grid: Total number of grid points.
-        n_bands: Number of orbitals to solve for.
-        x_init: Optional initial orbital guess with shape (n_grid, n_bands).
-        max_iter: Maximum subspace iterations.
-        tol: Reserved convergence tolerance parameter.
-        key: Optional JAX PRNG key used to seed orbital initialization. If not
-            provided, a fixed key is used for backwards-compatible behavior.
+    Stops when the maximum band residual
+        max_i ||H psi_i - eps_i psi_i||_2
+    falls below tol.
     """
     if key is None:
         key = jax.random.PRNGKey(42)
-    
+
     if x_init is None:
         X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
     else:
-        X = x_init + jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32) * 1e-6
+        X = x_init + 1e-6 * jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
 
-    # 1. 初始正交化，并**提前算出初始的 HX** (极其重要的优化，省去一半计算量)
+    # Initial orthonormalization
     X = jnp.linalg.qr(X)[0]
     HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
 
+    def cond_fun(state):
+        i, _, _, _, res_norm = state
+        return jnp.logical_and(i < max_iter, res_norm > tol)
+
     def body_fun(state):
-        i, X, HX, E = state
-        
-        # 1. 当前子空间解耦 (Rayleigh-Ritz)
+        i, X, HX, _, _ = state
+
+        # 1) Rayleigh-Ritz in current subspace
         H_sub = X.T @ HX
+        H_sub = 0.5 * (H_sub + H_sub.T)   # numerical symmetrization
         E, V_sub = jnp.linalg.eigh(H_sub)
+
         X = X @ V_sub
         HX = HX @ V_sub
-        
-        # 2. 计算残差梯度 R
-        R = HX - X * E[None, :]
-        
-        # 3. 将残差 R 与当前的 X 正交化 (Gram-Schmidt)
-        R = R - X @ (X.T @ R)
-        
-        # 4. 对 R 进行内部正交归一化，得到纯净的扩展基
-        R = jnp.linalg.qr(R)[0]
-        
-        # 5. 【核心】只对新的残差基 R 作用哈密顿量
-        HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R)
-        
-        # 6. 拼接构成 2 倍大小的扩展子空间 Z = [X, R]
-        Z = jnp.concatenate([X, R], axis=1)
-        HZ = jnp.concatenate([HX, HR], axis=1)
-        
-        # 7. 在 2N 维的子空间内进行极速对角化 (矩阵只有 2*n_bands 大小)
-        H_Z = Z.T @ HZ
-        E_Z, V_Z = jnp.linalg.eigh(H_Z)
-        
-        # 8. 提取能量最低的前 n_bands 个本征向量，作为完美更新后的波函数
-        X_new = Z @ V_Z[:, :n_bands]
-        HX_new = HZ @ V_Z[:, :n_bands]
-        
-        return i + 1, X_new, HX_new, E_Z[:n_bands]
 
-    final_state = jax.lax.while_loop(
-        lambda s: s[0] < max_iter,
-        body_fun,
-        (0, X, HX, jnp.zeros(n_bands)) # 注意这里 State 多传了一个 HX
+        # 2) Residual in current subspace
+        R = HX - X * E[None, :]
+        res_vec = jnp.sqrt(jnp.sum(R * R, axis=0))
+        res_norm = jnp.max(res_vec)
+
+        def done_branch(_):
+            return i + 1, X, HX, E, res_norm
+
+        def expand_branch(_):
+            # 3) Orthogonalize residuals against current subspace
+            R_ortho = R - X @ (X.T @ R)
+            R_ortho = jnp.linalg.qr(R_ortho)[0]
+
+            # 4) Expand subspace
+            HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R_ortho)
+
+            Z = jnp.concatenate([X, R_ortho], axis=1)
+            HZ = jnp.concatenate([HX, HR], axis=1)
+
+            # 5) Rayleigh-Ritz in expanded subspace
+            H_Z = Z.T @ HZ
+            H_Z = 0.5 * (H_Z + H_Z.T)
+            E_Z, V_Z = jnp.linalg.eigh(H_Z)
+
+            X_new = Z @ V_Z[:, :n_bands]
+            HX_new = HZ @ V_Z[:, :n_bands]
+            E_new = E_Z[:n_bands]
+
+            # 6) Residual after update
+            R_new = HX_new - X_new * E_new[None, :]
+            res_vec_new = jnp.sqrt(jnp.sum(R_new * R_new, axis=0))
+            res_norm_new = jnp.max(res_vec_new)
+
+            return i + 1, X_new, HX_new, E_new, res_norm_new
+
+        return jax.lax.cond(res_norm <= tol, done_branch, expand_branch, operand=None)
+
+    state0 = (
+        jnp.array(0, dtype=jnp.int32),
+        X,
+        HX,
+        jnp.full((n_bands,), jnp.inf, dtype=jnp.float32),
+        jnp.array(jnp.inf, dtype=jnp.float32),
     )
-    
-    _, X_final, _, E_final = final_state
+
+    _, X_final, _, E_final, _ = jax.lax.while_loop(cond_fun, body_fun, state0)
     return E_final, X_final
+
+
+def solve_orbitals_lobpcg(*args, **kwargs):
+    """
+    Backward-compatible alias.
+
+    The current implementation is a block subspace expansion solver,
+    not a strict textbook LOBPCG.
+    """
+    return solve_orbitals_subspace(*args, **kwargs)
 
 
 def precompute_poisson_kernel(grid_shape, spacing):
@@ -235,16 +267,17 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             hpsi = -0.5 * lap + V_eff * psi + v_nonlocal # 加上非局域项
             return hpsi.reshape(-1)
 
-        # 换回 Dense Solver
+        # Subspace eigensolver with residual-based convergence
         iter_key = jax.random.fold_in(key, i)
-        eigvals, eigvecs = solve_orbitals_lobpcg(
-            apply_h,
-            n_grid,
-            n_bands,
-            x_init=eigvecs0,
-            max_iter=30,
-            key=iter_key,
-        )
+        eigvals, eigvecs = solve_orbitals_subspace(
+    apply_h,
+    n_grid,
+    n_bands,
+    x_init=eigvecs0,
+    max_iter=30,
+    tol=1e-5,
+    key=iter_key,
+)
         
         # 归一化
         norm = jnp.sqrt(jnp.sum(eigvecs**2, axis=0) * volume_element)

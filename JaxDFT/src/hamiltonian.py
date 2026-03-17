@@ -7,37 +7,82 @@ finite-difference Laplacian. All quantities are in atomic units (Bohr, Hartree).
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import erf, gamma
-from jax.scipy.signal import convolve
 
-def create_grid(spacing, box_size):
-    """Create a uniform real-space grid for DFT calculations.
-
-    Args:
-        spacing: Grid spacing in Bohr.
-        box_size: Simulation box lengths [Lx, Ly, Lz] in Bohr.
-
-    Returns:
-        Grid object with coordinates, spacing, volume element, and mask.
+def create_grid(spacing, box_size, policy="preserve_box", tol=1e-8):
     """
-    box_size = jnp.array(box_size)
-    N = (box_size / spacing).astype(int) + 1
-    x = jnp.linspace(-box_size[0]/2, box_size[0]/2, N[0])
-    y = jnp.linspace(-box_size[1]/2, box_size[1]/2, N[1])
-    z = jnp.linspace(-box_size[2]/2, box_size[2]/2, N[2])
+    policy:
+        - "strict": require box_size / spacing to be integer in each direction
+        - "preserve_box": keep box_size exact, adjust actual spacing
+        - "preserve_spacing": keep spacing exact, adjust effective box_size
+    """
+    spacing = float(spacing)
+    box_size = jnp.asarray(box_size, dtype=jnp.float32)
+
+    ratios = box_size / spacing
+
+    if policy == "strict":
+        n_intervals = jnp.rint(ratios).astype(jnp.int32)
+        err = jnp.max(jnp.abs(ratios - n_intervals))
+        if float(err) > tol:
+            raise ValueError(
+                f"box_size must be an integer multiple of spacing. "
+                f"box_size={box_size.tolist()}, spacing={spacing}, "
+                f"box_size/spacing={ratios.tolist()}"
+            )
+        actual_box_size = box_size
+        actual_spacing_vec = box_size / n_intervals
+
+    elif policy == "preserve_box":
+        # 保留 box_size，允许真实 spacing 轻微偏离输入 spacing
+        n_intervals = jnp.maximum(1, jnp.rint(ratios).astype(jnp.int32))
+        actual_box_size = box_size
+        actual_spacing_vec = actual_box_size / n_intervals
+
+    elif policy == "preserve_spacing":
+        # 保留 spacing，允许 box_size 轻微偏离输入 box_size
+        n_intervals = jnp.maximum(1, jnp.rint(ratios).astype(jnp.int32))
+        actual_spacing_vec = jnp.array([spacing, spacing, spacing], dtype=jnp.float32)
+        actual_box_size = actual_spacing_vec * n_intervals
+
+    else:
+        raise ValueError("policy must be 'strict', 'preserve_box', or 'preserve_spacing'")
+
+    # 你当前下游代码假设是各向同性标量 spacing
+    if not jnp.allclose(actual_spacing_vec, actual_spacing_vec[0], atol=tol, rtol=0.0):
+        raise ValueError(
+            f"Current code assumes isotropic scalar spacing, but got actual_spacing={actual_spacing_vec.tolist()}"
+        )
+
+    actual_spacing = float(actual_spacing_vec[0])
+
+    nx, ny, nz = map(int, (n_intervals + 1).tolist())
+
+    x = jnp.linspace(-actual_box_size[0] / 2, actual_box_size[0] / 2, nx, dtype=jnp.float32)
+    y = jnp.linspace(-actual_box_size[1] / 2, actual_box_size[1] / 2, ny, dtype=jnp.float32)
+    z = jnp.linspace(-actual_box_size[2] / 2, actual_box_size[2] / 2, nz, dtype=jnp.float32)
+
     X, Y, Z = jnp.meshgrid(x, y, z, indexing="ij")
     coords = jnp.stack([X, Y, Z], axis=-1)
-    
-    class Grid: pass
+
+    class Grid:
+        pass
+
     grid = Grid()
     grid.coords = coords
     grid.shape = coords.shape[:-1]
-    grid.spacing = spacing
-    grid.box_size = box_size
-    grid.volume_element = spacing ** 3
+    grid.spacing = jnp.asarray(actual_spacing, dtype=jnp.float32)
+    grid.box_size = actual_box_size
+    grid.volume_element = grid.spacing ** 3
     grid.mask = jnp.ones(grid.shape, dtype=jnp.float32)
-    grid.projectors = [] 
-    return grid
+    grid.projectors = []
 
+    # 调试信息，方便你检查输入和实际采用值
+    grid.requested_spacing = jnp.asarray(spacing, dtype=jnp.float32)
+    grid.requested_box_size = box_size
+    grid.actual_spacing_vec = actual_spacing_vec
+    grid.n_intervals = n_intervals
+
+    return grid
 
 @jax.jit
 def gth_local_potential_value(r, zion, rloc, c):
@@ -79,70 +124,58 @@ def get_gth_projector(r, l, i, rp):
 
 @jax.jit
 def build_local_potential(atom_coords, grid_coords, zion, rloc, c):
-    """Assemble the total local ionic potential on the grid.
-
-    Args:
-        atom_coords: Ion coordinates, shape (n_atoms, 3), in Bohr.
-        grid_coords: Grid coordinates, shape (nx, ny, nz, 3), in Bohr.
-        zion: Ionic charges per atom.
-        rloc: Local radius parameters per atom, in Bohr.
-        c: Local polynomial coefficients per atom.
-
-    Returns:
-        Total local potential on the grid, in Hartree.
     """
-    V_total = jnp.zeros(grid_coords.shape[:-1], dtype=jnp.float32)
-    for i in range(len(zion)):
+    Assemble total local ionic potential on the grid.
+    Uses lax.fori_loop to avoid Python-loop unrolling inside jit.
+    """
+    atom_coords = jnp.asarray(atom_coords, dtype=jnp.float32)
+    zion = jnp.asarray(zion, dtype=jnp.float32)
+    rloc = jnp.asarray(rloc, dtype=jnp.float32)
+    c = jnp.asarray(c, dtype=jnp.float32)
+
+    init = jnp.zeros(grid_coords.shape[:-1], dtype=jnp.float32)
+
+    def body(i, V_total):
         diff = grid_coords - atom_coords[i]
-        r = jnp.linalg.norm(diff, axis=-1)
+        r = jnp.sqrt(jnp.sum(diff * diff, axis=-1))
         v = gth_local_potential_value(r, zion[i], rloc[i], c[i])
-        V_total = V_total + v
-    return V_total
+        return V_total + v
+
+    return jax.lax.fori_loop(0, atom_coords.shape[0], body, init)
 
 
 
 @jax.jit
 def laplacian_4th(psi, spacing, mask=None):
     """
-    使用 3D 卷积计算 4阶有限差分拉普拉斯算符。
-    利用 mode='same' 自动实现零填充（严格的 Dirichlet 边界条件）。
+    4th-order finite-difference Laplacian with strict Dirichlet BC
+    implemented by explicit zero-padding + stencil slices.
     """
-    h2 = spacing * spacing
-    c0 = -2.5 / h2
-    c1 = (4.0/3.0) / h2
-    c2 = (-1.0/12.0) / h2
-    
-    # 1. 构造 5x5x5 的拉普拉斯卷积核
-    # 绝大部分权重为 0，只有中心十字架上有值
-    kernel = jnp.zeros((5, 5, 5), dtype=psi.dtype)
-    
-    # 中心点 (x, y, z)
-    kernel = kernel.at[2, 2, 2].set(3.0 * c0)
-    
-    # 第一层近邻 (距离 1，系数 c1)
-    kernel = kernel.at[1, 2, 2].set(c1)
-    kernel = kernel.at[3, 2, 2].set(c1)
-    kernel = kernel.at[2, 1, 2].set(c1)
-    kernel = kernel.at[2, 3, 2].set(c1)
-    kernel = kernel.at[2, 2, 1].set(c1)
-    kernel = kernel.at[2, 2, 3].set(c1)
-    
-    # 第二层近邻 (距离 2，系数 c2)
-    kernel = kernel.at[0, 2, 2].set(c2)
-    kernel = kernel.at[4, 2, 2].set(c2)
-    kernel = kernel.at[2, 0, 2].set(c2)
-    kernel = kernel.at[2, 4, 2].set(c2)
-    kernel = kernel.at[2, 2, 0].set(c2)
-    kernel = kernel.at[2, 2, 4].set(c2)
-    
-    # 2. 执行 3D 卷积
-    # mode='same' 会在 psi 边缘自动补零，计算后保持原 shape
-    lap = convolve(psi, kernel, mode='same')
-    
-    # 3. 施加掩膜 (如有)
-    if mask is not None: 
+    inv_h2 = 1.0 / (spacing * spacing)
+    c0 = -2.5 * inv_h2
+    c1 = (4.0 / 3.0) * inv_h2
+    c2 = (-1.0 / 12.0) * inv_h2
+
+    p = jnp.pad(psi, ((2, 2), (2, 2), (2, 2)), mode="constant")
+
+    center = p[2:-2, 2:-2, 2:-2]
+
+    lap = (
+        3.0 * c0 * center
+        + c1 * (
+            p[1:-3, 2:-2, 2:-2] + p[3:-1, 2:-2, 2:-2]
+            + p[2:-2, 1:-3, 2:-2] + p[2:-2, 3:-1, 2:-2]
+            + p[2:-2, 2:-2, 1:-3] + p[2:-2, 2:-2, 3:-1]
+        )
+        + c2 * (
+            p[0:-4, 2:-2, 2:-2] + p[4:   , 2:-2, 2:-2]
+            + p[2:-2, 0:-4, 2:-2] + p[2:-2, 4:   , 2:-2]
+            + p[2:-2, 2:-2, 0:-4] + p[2:-2, 2:-2, 4:   ]
+        )
+    )
+
+    if mask is not None:
         lap = lap * mask
-        
     return lap
 
 
