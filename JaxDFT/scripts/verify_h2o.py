@@ -34,11 +34,11 @@ def run_pyscf(coords_list):
     except Exception:
         return float('nan')
 
-print(f"\n{'='*20} H2O 分子对称拉伸验证 (High Precision) {'='*20}")
+print(f"\n{'='*20} H2O 分子对称拉伸验证 (Ultra High Precision) {'='*20}")
 
-# 3. 计算参数
-target_spacing = 0.18
-L = 20.0  
+
+target_spacing = 0.12  
+L = 18.0  
 N_grid = int(round(L / target_spacing))
 spacing = L / N_grid
 box_size = [L, L, L]
@@ -46,7 +46,8 @@ box_size = [L, L, L]
 # H2O 平衡键长约 1.81 Bohr, 键角 104.5 度
 angle_deg = 104.5
 theta = angle_deg * math.pi / 180.0
-distances = [1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.8, 3.2]
+# 【修改点3】: 在平衡点 1.8 附近增加扫描密度
+distances = [1.4, 1.6, 1.7, 1.8, 1.9, 2.0, 2.2, 2.4, 2.8, 3.2]
 
 # 4. 加载赝势
 pseudos = load_pseudopotentials(["O", "H"], os.path.join(project_root, "data/gth_potentials"))
@@ -79,9 +80,16 @@ for d in distances:
     ]
     coords_jax = jnp.array(coords_list)
     
-    # 极度拉伸时降低 alpha 保证收敛
-    alpha = 0.1 if d >= 2.6 else 0.3
-    max_iter = 800 if d >= 2.6 else 400
+    # 【修改点4】: 更稳健的自适应 SCF 策略
+    if d >= 2.8:
+        alpha = 0.05
+        max_iter = 1200
+    elif d >= 2.4:
+        alpha = 0.1
+        max_iter = 800
+    else:
+        alpha = 0.3
+        max_iter = 400
     
     try:
         e_jax, _ = solver.energy_and_forces(
@@ -101,14 +109,14 @@ for d in distances:
 
 # 6. 绘图
 plt.figure(figsize=(10, 6))
-plt.plot(distances, jax_energies, 'o-', label='JaxDFT (RealSpace)')
+plt.plot(distances, jax_energies, 'o-', label=f'JaxDFT (spacing={spacing:.4f})')
 plt.plot(distances, pyscf_energies, 'x--', label='PySCF (TZVP)')
 plt.xlabel('O-H Symmetric Bond Length (Bohr)')
 plt.ylabel('Total Energy (Ha)')
 plt.title(f'H2O Symmetric Stretch Curve (Angle={angle_deg}°)')
 plt.legend()
 plt.grid(True, alpha=0.3)
-plt.savefig('h2o_verification.png', dpi=150)
+plt.savefig('h2o_verification_ultra.png', dpi=150)
 
 print("-" * 75)
 print("✅ 验证完成。结果已保存至 h2o_verification.png")
