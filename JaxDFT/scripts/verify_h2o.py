@@ -116,7 +116,7 @@ plt.ylabel('Total Energy (Ha)')
 plt.title(f'H2O Symmetric Stretch Curve (Angle={angle_deg}°)')
 plt.legend()
 plt.grid(True, alpha=0.3)
-plt.savefig('h2o_verification_ultra.png', dpi=150)
+plt.savefig('h2o_verification.png', dpi=150)
 
 print("-" * 75)
 print("✅ 验证完成。结果已保存至 h2o_verification.png")
