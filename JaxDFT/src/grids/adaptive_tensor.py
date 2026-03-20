@@ -18,7 +18,22 @@ Array = jnp.ndarray
 class AdaptiveTensorGrid:
     """Lightweight container matching the current uniform-grid object style."""
 
-    pass
+    def integrate(self, field: Array) -> Array:
+        """Integrate a scalar field using tensor-product volume weights."""
+        field = jnp.asarray(field)
+        if field.shape != self.shape:
+            raise ValueError(f"field shape {field.shape} does not match grid shape {self.shape}")
+        return jnp.sum(field * self.volume_weights)
+
+    def inner_product(self, x: Array, y: Array) -> Array:
+        """Return the weighted inner product on the adaptive tensor grid."""
+        x = jnp.asarray(x)
+        y = jnp.asarray(y)
+        if x.shape != self.shape or y.shape != self.shape:
+            raise ValueError(
+                f"inner_product expects shapes {self.shape}, got x={x.shape}, y={y.shape}"
+            )
+        return self.integrate(jnp.conjugate(x) * y)
 
 
 def make_reference_axis(

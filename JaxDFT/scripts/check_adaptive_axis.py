@@ -96,6 +96,19 @@ def main() -> int:
     volume_sum = float(jnp.sum(grid.volume_weights))
     rel_volume_error = abs(volume_sum - box_volume) / box_volume
 
+    ones = jnp.ones(grid.shape, dtype=jnp.float32)
+    gaussian_alpha = 0.35
+    gaussian = jnp.exp(-gaussian_alpha * jnp.sum(grid.coords ** 2, axis=-1))
+    gaussian_expected = (
+        jnp.sum(grid.wx * jnp.exp(-gaussian_alpha * grid.x ** 2))
+        * jnp.sum(grid.wy * jnp.exp(-gaussian_alpha * grid.y ** 2))
+        * jnp.sum(grid.wz * jnp.exp(-gaussian_alpha * grid.z ** 2))
+    )
+    constant_integral = float(grid.integrate(ones))
+    gaussian_integral = float(grid.integrate(gaussian))
+    ones_inner = float(grid.inner_product(ones, ones))
+    ones_gaussian_inner = float(grid.inner_product(ones, gaussian))
+
     all_ok &= check(
         "x_monotone",
         bool(jnp.all(dx > 0.0)),
@@ -161,6 +174,26 @@ def main() -> int:
         f"sum(volume_weights)={volume_sum:.6f}, box_volume={box_volume:.6f}, rel_err={rel_volume_error:.3e}",
     )
     all_ok &= check(
+        "constant_integral",
+        abs(constant_integral - box_volume) / box_volume <= 1e-6,
+        f"integrate(1)={constant_integral:.6f}, box_volume={box_volume:.6f}",
+    )
+    all_ok &= check(
+        "ones_inner_product",
+        abs(ones_inner - box_volume) / box_volume <= 1e-6,
+        f"<1,1>={ones_inner:.6f}, box_volume={box_volume:.6f}",
+    )
+    all_ok &= check(
+        "gaussian_integral",
+        bool(jnp.isclose(gaussian_integral, gaussian_expected, atol=1e-5, rtol=1e-6)),
+        f"integrate(gauss)={gaussian_integral:.6f}, separable_expected={float(gaussian_expected):.6f}",
+    )
+    all_ok &= check(
+        "ones_gaussian_inner",
+        abs(ones_gaussian_inner - gaussian_integral) <= 1e-5,
+        f"<1,gauss>={ones_gaussian_inner:.6f}, integrate(gauss)={gaussian_integral:.6f}",
+    )
+    all_ok &= check(
         "adaptive_not_uniform",
         bool((jnp.min(dx) < jnp.max(dx)) and (jnp.min(dy) < jnp.max(dy)) and (jnp.min(dz) < jnp.max(dz))),
         (
@@ -177,6 +210,9 @@ def main() -> int:
     print(f"sum(volume_weights)={volume_sum:.6f}")
     print(f"expected_box_volume={box_volume:.6f}")
     print(f"relative_volume_error={rel_volume_error:.3e}")
+    print(f"integrate(1)={constant_integral:.6f}")
+    print(f"<1,1>={ones_inner:.6f}")
+    print(f"integrate(gauss)={gaussian_integral:.6f}")
     print(f"backend_name={grid.backend_name}")
 
     if all_ok:
