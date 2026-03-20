@@ -1,8 +1,8 @@
-"""Adaptive tensor-product axis helpers for future nonuniform grids.
+"""Adaptive tensor-product grid helpers for future nonuniform backends.
 
-Patch A intentionally implements only 1D axis generation, nodal integration
-weights, and tensor-product volume weights. It does not modify any SCF,
-backend, or solver execution path.
+Patch A/B intentionally stays below the SCF layer. It provides 1D adaptive axes,
+nodal integration weights, tensor-product volume weights, and a minimal 3D grid
+state without modifying any existing solver execution path.
 """
 
 from __future__ import annotations
@@ -13,6 +13,12 @@ import jax.numpy as jnp
 
 
 Array = jnp.ndarray
+
+
+class AdaptiveTensorGrid:
+    """Lightweight container matching the current uniform-grid object style."""
+
+    pass
 
 
 def make_reference_axis(
@@ -226,10 +232,101 @@ def create_adaptive_axis(
     return axis, weights, meta
 
 
+def create_adaptive_grid(
+    box_size: Array,
+    atom_coords: Array,
+    h_min: float,
+    h_max: float,
+    r_core: float,
+    stretch_beta: float,
+    *,
+    n_ref: int = 4097,
+    stretch_rule: str = "gaussian_sum",
+    uniform_tol: float = 1e-8,
+) -> AdaptiveTensorGrid:
+    """Assemble a minimal 3D adaptive tensor grid state from 1D axes."""
+    box_size = jnp.asarray(box_size, dtype=jnp.float32).reshape(-1)
+    atom_coords = jnp.asarray(atom_coords, dtype=jnp.float32)
+
+    if box_size.size != 3:
+        raise ValueError(f"box_size must contain three entries, got shape {box_size.shape}")
+    if bool(jnp.any(box_size <= 0.0)):
+        raise ValueError(f"box_size entries must be positive, got {box_size}")
+    if atom_coords.ndim != 2 or atom_coords.shape[1] != 3:
+        raise ValueError(f"atom_coords must have shape (n_atoms, 3), got {atom_coords.shape}")
+
+    x, wx, x_meta = create_adaptive_axis(
+        float(box_size[0]),
+        atom_coords[:, 0],
+        h_min,
+        h_max,
+        r_core,
+        stretch_beta,
+        n_ref=n_ref,
+        stretch_rule=stretch_rule,
+        uniform_tol=uniform_tol,
+    )
+    y, wy, y_meta = create_adaptive_axis(
+        float(box_size[1]),
+        atom_coords[:, 1],
+        h_min,
+        h_max,
+        r_core,
+        stretch_beta,
+        n_ref=n_ref,
+        stretch_rule=stretch_rule,
+        uniform_tol=uniform_tol,
+    )
+    z, wz, z_meta = create_adaptive_axis(
+        float(box_size[2]),
+        atom_coords[:, 2],
+        h_min,
+        h_max,
+        r_core,
+        stretch_beta,
+        n_ref=n_ref,
+        stretch_rule=stretch_rule,
+        uniform_tol=uniform_tol,
+    )
+
+    X, Y, Z = jnp.meshgrid(x, y, z, indexing="ij")
+    coords = jnp.stack([X, Y, Z], axis=-1)
+    volume_weights = build_volume_weights(wx, wy, wz)
+
+    grid = AdaptiveTensorGrid()
+    grid.x = x
+    grid.y = y
+    grid.z = z
+    grid.wx = wx
+    grid.wy = wy
+    grid.wz = wz
+    grid.volume_weights = volume_weights
+    grid.coords = coords
+    grid.shape = coords.shape[:-1]
+    grid.mask = jnp.ones(grid.shape, dtype=jnp.float32)
+    grid.box_size = box_size.reshape(3)
+    grid.backend_name = "adaptive_tensor"
+    grid.projectors = []
+    grid.h_min = float(h_min)
+    grid.h_max = float(h_max)
+    grid.r_core = float(r_core)
+    grid.stretch_beta = float(stretch_beta)
+    grid.stretch_rule = stretch_rule
+    grid.requested_box_size = grid.box_size
+    grid.n_ref = int(n_ref)
+    grid.n_intervals = jnp.asarray([x.size - 1, y.size - 1, z.size - 1], dtype=jnp.int32)
+    grid.x_meta = x_meta
+    grid.y_meta = y_meta
+    grid.z_meta = z_meta
+    return grid
+
+
 __all__ = [
+    "AdaptiveTensorGrid",
     "make_reference_axis",
     "build_axis_spacing_profile",
     "create_adaptive_axis",
+    "create_adaptive_grid",
     "compute_axis_weights",
     "build_volume_weights",
 ]

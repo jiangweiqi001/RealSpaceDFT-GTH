@@ -17,10 +17,18 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 try:
-    from JaxDFT.src.grids import build_volume_weights, create_adaptive_axis
+    from JaxDFT.src.grids.adaptive_tensor import (
+        build_volume_weights,
+        create_adaptive_axis,
+        create_adaptive_grid,
+    )
 except ImportError:
     sys.path.insert(0, os.path.join(project_root, "JaxDFT"))
-    from src.grids import build_volume_weights, create_adaptive_axis
+    from src.grids.adaptive_tensor import (
+        build_volume_weights,
+        create_adaptive_axis,
+        create_adaptive_grid,
+    )
 
 
 def check(name: str, condition: bool, detail: str) -> bool:
@@ -77,17 +85,15 @@ def main() -> int:
         f"max|dw|={float(jnp.max(jnp.abs(wx_uni - expected_weights))):.3e}",
     )
 
-    print("\n=== Adaptive Axis Check ===")
-    x, wx, meta_x = create_adaptive_axis(float(box[0]), coords[:, 0], h_min, h_max, r_core, stretch_beta)
-    y, wy, meta_y = create_adaptive_axis(float(box[1]), coords[:, 1], h_min, h_max, r_core, stretch_beta)
-    z, wz, meta_z = create_adaptive_axis(float(box[2]), coords[:, 2], h_min, h_max, r_core, stretch_beta)
-    volume_weights = build_volume_weights(wx, wy, wz)
+    print("\n=== Adaptive Grid Check ===")
+    grid = create_adaptive_grid(box, coords, h_min, h_max, r_core, stretch_beta)
+    rebuilt_volume_weights = build_volume_weights(grid.wx, grid.wy, grid.wz)
 
-    dx = x[1:] - x[:-1]
-    dy = y[1:] - y[:-1]
-    dz = z[1:] - z[:-1]
+    dx = grid.x[1:] - grid.x[:-1]
+    dy = grid.y[1:] - grid.y[:-1]
+    dz = grid.z[1:] - grid.z[:-1]
     box_volume = float(jnp.prod(box))
-    volume_sum = float(jnp.sum(volume_weights))
+    volume_sum = float(jnp.sum(grid.volume_weights))
     rel_volume_error = abs(volume_sum - box_volume) / box_volume
 
     all_ok &= check(
@@ -107,19 +113,47 @@ def main() -> int:
     )
     all_ok &= check(
         "weights_positive",
-        bool(jnp.all(wx > 0.0) and jnp.all(wy > 0.0) and jnp.all(wz > 0.0)),
-        f"min(wx,wy,wz)=({float(jnp.min(wx)):.6f}, {float(jnp.min(wy)):.6f}, {float(jnp.min(wz)):.6f})",
+        bool(jnp.all(grid.wx > 0.0) and jnp.all(grid.wy > 0.0) and jnp.all(grid.wz > 0.0)),
+        f"min(wx,wy,wz)=({float(jnp.min(grid.wx)):.6f}, {float(jnp.min(grid.wy)):.6f}, {float(jnp.min(grid.wz)):.6f})",
     )
     all_ok &= check(
         "axis_weight_sums",
         bool(
-            jnp.isclose(jnp.sum(wx), box[0], atol=1e-5, rtol=0.0)
-            and jnp.isclose(jnp.sum(wy), box[1], atol=1e-5, rtol=0.0)
-            and jnp.isclose(jnp.sum(wz), box[2], atol=1e-5, rtol=0.0)
+            jnp.isclose(jnp.sum(grid.wx), box[0], atol=1e-5, rtol=0.0)
+            and jnp.isclose(jnp.sum(grid.wy), box[1], atol=1e-5, rtol=0.0)
+            and jnp.isclose(jnp.sum(grid.wz), box[2], atol=1e-5, rtol=0.0)
         ),
-        (
-            f"sum(wx,wy,wz)=({float(jnp.sum(wx)):.6f}, {float(jnp.sum(wy)):.6f}, {float(jnp.sum(wz)):.6f})"
-        ),
+        f"sum(wx,wy,wz)=({float(jnp.sum(grid.wx)):.6f}, {float(jnp.sum(grid.wy)):.6f}, {float(jnp.sum(grid.wz)):.6f})",
+    )
+    all_ok &= check(
+        "grid_shape_matches_coords",
+        grid.coords.shape[:-1] == grid.shape,
+        f"coords.shape={grid.coords.shape}, shape={grid.shape}",
+    )
+    all_ok &= check(
+        "volume_shape_matches_grid",
+        grid.volume_weights.shape == grid.shape,
+        f"volume_weights.shape={grid.volume_weights.shape}, shape={grid.shape}",
+    )
+    all_ok &= check(
+        "coords_last_dim",
+        grid.coords.shape[-1] == 3,
+        f"coords.shape[-1]={grid.coords.shape[-1]}",
+    )
+    all_ok &= check(
+        "mask_all_ones",
+        bool(jnp.all(grid.mask == 1.0)),
+        f"mask_min={float(jnp.min(grid.mask)):.1f}, mask_max={float(jnp.max(grid.mask)):.1f}",
+    )
+    all_ok &= check(
+        "backend_name",
+        grid.backend_name == "adaptive_tensor",
+        f"backend_name={grid.backend_name}",
+    )
+    all_ok &= check(
+        "volume_weight_rebuild",
+        bool(jnp.allclose(grid.volume_weights, rebuilt_volume_weights, atol=1e-7, rtol=0.0)),
+        f"max|dV|={float(jnp.max(jnp.abs(grid.volume_weights - rebuilt_volume_weights))):.3e}",
     )
     all_ok &= check(
         "volume_consistency",
@@ -130,18 +164,20 @@ def main() -> int:
         "adaptive_not_uniform",
         bool((jnp.min(dx) < jnp.max(dx)) and (jnp.min(dy) < jnp.max(dy)) and (jnp.min(dz) < jnp.max(dz))),
         (
-            f"x[min,max]=({meta_x['actual_min_spacing']:.6f}, {meta_x['actual_max_spacing']:.6f}), "
-            f"y[min,max]=({meta_y['actual_min_spacing']:.6f}, {meta_y['actual_max_spacing']:.6f}), "
-            f"z[min,max]=({meta_z['actual_min_spacing']:.6f}, {meta_z['actual_max_spacing']:.6f})"
+            f"x[min,max]=({grid.x_meta['actual_min_spacing']:.6f}, {grid.x_meta['actual_max_spacing']:.6f}), "
+            f"y[min,max]=({grid.y_meta['actual_min_spacing']:.6f}, {grid.y_meta['actual_max_spacing']:.6f}), "
+            f"z[min,max]=({grid.z_meta['actual_min_spacing']:.6f}, {grid.z_meta['actual_max_spacing']:.6f})"
         ),
     )
 
     print("\n=== Summary ===")
-    print(f"shape=({x.size}, {y.size}, {z.size})")
-    print(f"sum(wx)={float(jnp.sum(wx)):.6f}, sum(wy)={float(jnp.sum(wy)):.6f}, sum(wz)={float(jnp.sum(wz)):.6f}")
+    print(f"shape={grid.shape}")
+    print(f"box_size={tuple(float(x) for x in grid.box_size)}")
+    print(f"sum(wx)={float(jnp.sum(grid.wx)):.6f}, sum(wy)={float(jnp.sum(grid.wy)):.6f}, sum(wz)={float(jnp.sum(grid.wz)):.6f}")
     print(f"sum(volume_weights)={volume_sum:.6f}")
     print(f"expected_box_volume={box_volume:.6f}")
     print(f"relative_volume_error={rel_volume_error:.3e}")
+    print(f"backend_name={grid.backend_name}")
 
     if all_ok:
         print("OVERALL: PASS")
