@@ -1,11 +1,13 @@
 ﻿"""Uniform-grid backend wrapper for the existing real-space implementation.
 
 Patch 2 intentionally keeps this backend as a thin adapter over the current
-uniform-grid kernels. It is not wired into the solver runtime path yet.
+uniform-grid kernels. Patch 3 wires the solver to this backend while keeping
+all external APIs unchanged.
 """
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from .base import ArrayLike, BackendState, NonlocalCache
@@ -18,10 +20,37 @@ from ..hamiltonian import (
 )
 
 
+def precompute_uniform_poisson_kernel(grid_shape, spacing):
+    """Precompute the current uniform-grid Poisson kernel."""
+    nx, ny, nz = grid_shape
+    x = jnp.fft.fftfreq(2 * nx, d=1.0 / (2 * nx)) * spacing
+    y = jnp.fft.fftfreq(2 * ny, d=1.0 / (2 * ny)) * spacing
+    z = jnp.fft.fftfreq(2 * nz, d=1.0 / (2 * nz)) * spacing
+    kx, ky, kz = jnp.meshgrid(x, y, z, indexing='ij')
+    r = jnp.sqrt(kx**2 + ky**2 + kz**2)
+
+    kernel = jnp.where(r > 1e-8, 1.0 / r, 2.38 / spacing)
+    return jnp.fft.fftn(kernel)
+
+
+@jax.jit
+def solve_uniform_poisson(rho, kernel_k, spacing):
+    """Solve the current uniform-grid Poisson problem via zero-padded FFT."""
+    nx, ny, nz = rho.shape
+    rho_pad = jnp.pad(rho, ((0, nx), (0, ny), (0, nz)), mode='constant')
+
+    rho_k = jnp.fft.fftn(rho_pad)
+    v_pad = jnp.fft.ifftn(rho_k * kernel_k).real * (spacing**3)
+    return v_pad[:nx, :ny, :nz]
+
+
 class UniformBackend:
     """Thin wrapper over the current uniform-grid numerical kernels."""
 
-    name = "uniform"
+    name = 'uniform'
+
+    def __init__(self):
+        self._hartree_kernel_cache = {}
 
     def create_grid(self, spacing: float, box_size: ArrayLike, **kwargs) -> BackendState:
         """Create the existing uniform-grid state."""
@@ -42,9 +71,9 @@ class UniformBackend:
         pseudos: ArrayLike,
     ) -> ArrayLike:
         """Assemble the local ionic potential on the existing uniform grid."""
-        zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
-        rloc = jnp.asarray([p["rloc"] for p in pseudos], dtype=jnp.float32)
-        c = jnp.asarray([p["c"] for p in pseudos], dtype=jnp.float32)
+        zion = jnp.asarray([p['zion'] for p in pseudos], dtype=jnp.float32)
+        rloc = jnp.asarray([p['rloc'] for p in pseudos], dtype=jnp.float32)
+        c = jnp.asarray([p['c'] for p in pseudos], dtype=jnp.float32)
         return build_local_potential_uniform(atom_coords, state.coords, zion, rloc, c)
 
     def apply_kinetic(self, state: BackendState, psi: ArrayLike) -> ArrayLike:
@@ -52,11 +81,13 @@ class UniformBackend:
         return -0.5 * laplacian_8th(psi, state.spacing, state.mask)
 
     def solve_hartree(self, state: BackendState, rho: ArrayLike) -> ArrayLike:
-        """Placeholder until the solver is explicitly wired to backend hooks."""
-        raise NotImplementedError(
-            "UniformBackend.solve_hartree is intentionally left unwired in Patch 2. "
-            "Patch 3 will connect the existing uniform Hartree path through the backend interface."
-        )
+        """Solve Hartree using the current uniform-grid FFT Poisson path."""
+        key = (tuple(int(n) for n in state.shape), float(state.spacing))
+        kernel_k = self._hartree_kernel_cache.get(key)
+        if kernel_k is None:
+            kernel_k = precompute_uniform_poisson_kernel(state.shape, state.spacing)
+            self._hartree_kernel_cache[key] = kernel_k
+        return solve_uniform_poisson(rho, kernel_k, state.spacing)
 
     def precompute_nonlocal(
         self,

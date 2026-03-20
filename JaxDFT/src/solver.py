@@ -7,8 +7,12 @@ the Kohn-Sham eigenproblem, and mixes the density until convergence.
 
 import jax
 import jax.numpy as jnp
+from .backends.uniform import (
+    UniformBackend,
+    precompute_uniform_poisson_kernel,
+    solve_uniform_poisson,
+)
 from .functional import lda_xc
-from .hamiltonian import laplacian_8th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
 
 
 def solve_orbitals_subspace(
@@ -113,26 +117,18 @@ def solve_orbitals_lobpcg(*args, **kwargs):
     return solve_orbitals_subspace(*args, **kwargs)
 
 
-def precompute_poisson_kernel(grid_shape, spacing):
-    nx, ny, nz = grid_shape
-    x = jnp.fft.fftfreq(2*nx, d=1.0/(2*nx)) * spacing
-    y = jnp.fft.fftfreq(2*ny, d=1.0/(2*ny)) * spacing
-    z = jnp.fft.fftfreq(2*nz, d=1.0/(2*nz)) * spacing
-    KX, KY, KZ = jnp.meshgrid(x, y, z, indexing='ij')
-    R = jnp.sqrt(KX**2 + KY**2 + KZ**2)
-    
-    kernel = jnp.where(R > 1e-8, 1.0 / R, 2.38 / spacing)
-    return jnp.fft.fftn(kernel)
+def _resolve_backend(backend):
+    return UniformBackend() if backend is None else backend
 
-@jax.jit
+
+def precompute_poisson_kernel(grid_shape, spacing):
+    """Backward-compatible wrapper for the current uniform Poisson kernel."""
+    return precompute_uniform_poisson_kernel(grid_shape, spacing)
+
+
 def solve_poisson(rho, kernel_k, spacing):
-    nx, ny, nz = rho.shape
-    rho_pad = jnp.pad(rho, ((0, nx), (0, ny), (0, nz)), mode='constant')
-    
-    rho_k = jnp.fft.fftn(rho_pad)
-    v_pad = jnp.fft.ifftn(rho_k * kernel_k).real * (spacing**3)
-    v = v_pad[:nx, :ny, :nz]
-    return v
+    """Backward-compatible wrapper for the current uniform Poisson solve."""
+    return solve_uniform_poisson(rho, kernel_k, spacing)
 
 
 def solve_orbitals_dense(apply_h_fn, n_grid, n_bands):
@@ -196,7 +192,7 @@ def anderson_mixing(rho, rho_new, f_hist, mix_alpha, iter_idx, m=5):
     return jax.lax.cond(iter_idx == 0, first, later, operand=None)
 
 
-def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key):
+def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key, backend=None):
     """Run the self-consistent field (SCF) loop.
 
     Args:
@@ -215,22 +211,21 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         Tuple (rho, eigvals, eigvecs, V_H, eps_xc, v_xc) where energies are in
         Hartree and densities in Bohr^-3.
     """
+    backend = _resolve_backend(backend)
     coords = jnp.asarray(coords, dtype=jnp.float32)
     if key is None:
         key = jax.random.PRNGKey(42)
-    volume_element = grid.volume_element
     
     # 初始密度
     rho = jnp.zeros(grid.shape, dtype=jnp.float32)
     for a in range(coords.shape[0]):
         r = jnp.linalg.norm(grid.coords - coords[a], axis=-1)
         rho = rho + jnp.exp(-2.0 * r**2)
-    rho = rho / (jnp.sum(rho) * volume_element) * jnp.sum(occ)
+    rho = rho / backend.integrate(grid, rho) * jnp.sum(occ)
 
     f_hist = jnp.zeros((5, rho.size), dtype=jnp.float32)
     n_grid = rho.size
-    kernel_k = precompute_poisson_kernel(grid.shape, grid.spacing)
-    proj_data = precompute_projectors(grid, coords, projectors)
+    proj_data = backend.precompute_nonlocal(grid, coords, projectors)
     # 占位符
     eigvals0 = jnp.zeros((n_bands,), dtype=jnp.float32)
     eigvecs0 = jnp.zeros((n_grid, n_bands), dtype=jnp.float32)
@@ -249,22 +244,17 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         rho_cur = jnp.clip(rho_cur, 1e-12, None)
         
 
-        V_H = solve_poisson(rho_cur, kernel_k, grid.spacing)
+        V_H = backend.solve_hartree(grid, rho_cur)
         
         eps_xc, v_xc = lda_xc(rho_cur)
         V_eff = V_loc + V_H + v_xc
 
         def apply_h(psi_flat):
             psi = psi_flat.reshape(grid.shape)
-            lap = laplacian_8th(psi, grid.spacing, grid.mask)
-            
-            if proj_data is not None:
-                P_i, P_j, coeffs = proj_data
-                v_nonlocal = apply_nonlocal_precomputed(psi, P_i, P_j, coeffs, grid.volume_element)
-            else:
-                v_nonlocal = jnp.zeros_like(psi)
-            
-            hpsi = -0.5 * lap + V_eff * psi + v_nonlocal # 加上非局域项
+            kinetic_psi = backend.apply_kinetic(grid, psi)
+            v_nonlocal = backend.apply_nonlocal(grid, psi, proj_data)
+
+            hpsi = kinetic_psi + V_eff * psi + v_nonlocal # ?????????
             return hpsi.reshape(-1)
 
         # Subspace eigensolver with residual-based convergence
@@ -280,8 +270,9 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
 )
         
         # 归一化
-        norm = jnp.sqrt(jnp.sum(eigvecs**2, axis=0) * volume_element)
-        eigvecs = eigvecs / norm
+        eigvec_fields = jnp.moveaxis(eigvecs.reshape(grid.shape + (n_bands,)), -1, 0)
+        norm = jnp.sqrt(jax.vmap(lambda psi: backend.inner_product(grid, psi, psi))(eigvec_fields))
+        eigvecs = eigvecs / norm[None, :]
         
         rho_new = jnp.sum((eigvecs ** 2) * occ[None, :], axis=1).reshape(grid.shape)
         diff = jnp.max(jnp.abs(rho_new - rho_cur))
@@ -301,7 +292,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     return rho, eigvals, eigvecs, V_H, eps_xc, v_xc
 
 
-def total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, volume_element, ion_ion):
+def total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, integration_state, ion_ion, backend=None):
     """Compute the total DFT energy from standard components.
 
     Args:
@@ -319,9 +310,15 @@ def total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, volume_element, io
         Total energy in Hartree.
     """
     e_band = jnp.sum(eigvals * occ)
-    e_h_integral = 0.5 * volume_element * jnp.sum(rho * V_H)
-    e_xc_integral = volume_element * jnp.sum(eps_xc)
-    e_vxc_integral = volume_element * jnp.sum(rho * v_xc)
+    if backend is None:
+        volume_element = integration_state
+        e_h_integral = 0.5 * volume_element * jnp.sum(rho * V_H)
+        e_xc_integral = volume_element * jnp.sum(eps_xc)
+        e_vxc_integral = volume_element * jnp.sum(rho * v_xc)
+    else:
+        e_h_integral = 0.5 * backend.integrate(integration_state, rho * V_H)
+        e_xc_integral = backend.integrate(integration_state, eps_xc)
+        e_vxc_integral = backend.integrate(integration_state, rho * v_xc)
     return e_band - e_h_integral + e_xc_integral - e_vxc_integral + ion_ion
 
 
@@ -343,7 +340,7 @@ def ion_ion_energy(coords, zion):
     return e
 
 
-def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key):
+def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key, backend=None):
     """Run SCF and return total energy and forces.
 
     Args:
@@ -359,9 +356,8 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         Tuple (energy, forces) where energy is in Hartree and forces are in
         Hartree/Bohr. Forces are currently zeros in this implementation.
     """
-    zion = jnp.asarray([p["zion"] for p in pseudos])
-    rloc = jnp.asarray([p["rloc"] for p in pseudos])
-    c = jnp.asarray([p["c"] for p in pseudos])
+    backend = _resolve_backend(backend)
+    zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
     
     n_electrons = jnp.sum(jnp.asarray([p["q"] for p in pseudos]))
     n_bands = int(jnp.ceil(n_electrons / 2.0))
@@ -372,7 +368,7 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         occ = occ.at[i].set(val)
         rem -= val
 
-    V_loc = build_local_potential(coords, grid.coords, zion, rloc, c)
+    V_loc = backend.build_local_potential(grid, coords, pseudos)
     rho, eigvals, eigvecs, V_H, eps_xc, v_xc = scf(
         grid, 
         coords, 
@@ -383,9 +379,10 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         max_iter, 
         mix_alpha, 
         tolerance, 
-        key
+        key,
+        backend=backend,
     )
     
     ion_e = ion_ion_energy(coords, zion)
-    E_tot = total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, grid.volume_element, ion_e)
+    E_tot = total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, grid, ion_e, backend=backend)
     return E_tot, jnp.zeros_like(coords)
