@@ -15,6 +15,64 @@ from .backends.uniform import (
 from .functional import lda_xc
 
 
+def _metric_scale(grid, backend):
+    """Return a normalization scale for backend-aware inner products.
+
+    The scale is chosen so that a uniform grid with cell volume ``dv`` reduces
+    to the usual Euclidean dot product up to numerical noise.
+    """
+    ones = jnp.ones(grid.shape, dtype=jnp.float32)
+    n_grid = jnp.asarray(jnp.prod(jnp.asarray(grid.shape)), dtype=jnp.float32)
+    return backend.integrate(grid, ones) / jnp.maximum(n_grid, 1.0)
+
+
+def _metric_inner_flat(grid, backend, x, y, scale):
+    """Evaluate the backend-aware inner product for flattened vectors."""
+    x_field = x.reshape(grid.shape)
+    y_field = y.reshape(grid.shape)
+    return backend.inner_product(grid, x_field, y_field) / scale
+
+
+def _metric_gram(grid, backend, X, Y, scale):
+    """Build the backend-aware block Gram matrix X^T W Y."""
+
+    def against_y(y_col):
+        return jax.vmap(lambda x_col: _metric_inner_flat(grid, backend, x_col, y_col, scale), in_axes=1)(X)
+
+    return jax.vmap(against_y, in_axes=1, out_axes=1)(Y)
+
+
+def _metric_symmetrize(mat):
+    """Symmetrize a small dense matrix to reduce numerical asymmetry."""
+    return 0.5 * (mat + mat.T)
+
+
+def _metric_orthonormalize(grid, backend, X, scale, eps=1e-8):
+    """Metric-orthonormalize a block of vectors using its small Gram matrix."""
+    S = _metric_symmetrize(_metric_gram(grid, backend, X, X, scale))
+    evals, evecs = jnp.linalg.eigh(S)
+    eps = jnp.asarray(eps, dtype=evals.dtype)
+    safe_evals = jnp.maximum(evals, eps)
+    inv_sqrt = jnp.where(evals > eps, 1.0 / jnp.sqrt(safe_evals), 0.0)
+    return X @ (evecs * inv_sqrt[None, :])
+
+
+def _metric_project_out(grid, backend, basis, vecs, scale):
+    """Project vecs orthogonally to basis under the backend-aware metric."""
+    coeff = _metric_gram(grid, backend, basis, vecs, scale)
+    return vecs - basis @ coeff
+
+
+def _metric_block_norms(grid, backend, R, scale):
+    """Return backend-aware norms for each column in R."""
+
+    def one_norm(vec):
+        val = _metric_inner_flat(grid, backend, vec, vec, scale)
+        return jnp.sqrt(jnp.maximum(val, 0.0))
+
+    return jax.vmap(one_norm, in_axes=1, out_axes=0)(R)
+
+
 def solve_orbitals_subspace(
     apply_h_fn,
     n_grid,
@@ -23,6 +81,8 @@ def solve_orbitals_subspace(
     max_iter=100,
     tol=1e-5,
     key=None,
+    grid=None,
+    backend=None,
 ):
     """
     Iterative eigensolver using block subspace expansion + Rayleigh-Ritz.
@@ -30,9 +90,19 @@ def solve_orbitals_subspace(
     Stops when the maximum band residual
         max_i ||H psi_i - eps_i psi_i||_2
     falls below tol.
+
+    The optional ``grid`` and ``backend`` arguments reserve a future entry point
+    for a weighted-metric subspace solver. Patch 2 keeps the current Euclidean
+    algorithm unchanged unless later patches explicitly switch to those helpers.
     """
     if key is None:
         key = jax.random.PRNGKey(42)
+
+    if (grid is None) != (backend is None):
+        raise ValueError(
+            "solve_orbitals_subspace expects both grid and backend together "
+            "for the future metric-aware path"
+        )
 
     if x_init is None:
         X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
