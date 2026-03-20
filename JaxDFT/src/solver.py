@@ -182,14 +182,11 @@ def solve_orbitals_subspace(
     scale = _metric_scale(grid, backend)
     X = _metric_orthonormalize(grid, backend, X, scale)
     HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
+    E = jnp.full((n_bands,), jnp.inf, dtype=jnp.float32)
+    res_norm = jnp.array(jnp.inf, dtype=jnp.float32)
+    i = 0
 
-    def cond_fun(state):
-        i, _, _, _, res_norm = state
-        return jnp.logical_and(i < max_iter, res_norm > tol)
-
-    def body_fun(state):
-        i, X, HX, _, _ = state
-
+    while i < max_iter and float(res_norm) > tol:
         # 1) Rayleigh-Ritz in current metric-orthonormal subspace
         H_sub = _metric_symmetrize(_metric_gram(grid, backend, X, HX, scale))
         E, V_sub = jnp.linalg.eigh(H_sub)
@@ -201,47 +198,34 @@ def solve_orbitals_subspace(
         R = HX - X * E[None, :]
         res_vec = _metric_block_norms(grid, backend, R, scale)
         res_norm = jnp.max(res_vec)
+        if float(res_norm) <= tol:
+            i += 1
+            break
 
-        def done_branch(_):
-            return i + 1, X, HX, E, res_norm
+        # 3) Orthogonalize residuals against current subspace in metric W
+        R_ortho = _metric_project_out(grid, backend, X, R, scale)
+        R_ortho = _metric_orthonormalize(grid, backend, R_ortho, scale)
 
-        def expand_branch(_):
-            # 3) Orthogonalize residuals against current subspace in metric W
-            R_ortho = _metric_project_out(grid, backend, X, R, scale)
-            R_ortho = _metric_orthonormalize(grid, backend, R_ortho, scale)
+        # 4) Expand and re-orthonormalize the full subspace for stability
+        Z = jnp.concatenate([X, R_ortho], axis=1)
+        Z = _metric_orthonormalize(grid, backend, Z, scale)
+        HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
 
-            # 4) Expand and re-orthonormalize the full subspace for stability
-            Z = jnp.concatenate([X, R_ortho], axis=1)
-            Z = _metric_orthonormalize(grid, backend, Z, scale)
-            HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
+        # 5) Rayleigh-Ritz in expanded metric-orthonormal subspace
+        H_Z = _metric_symmetrize(_metric_gram(grid, backend, Z, HZ, scale))
+        E_Z, V_Z = jnp.linalg.eigh(H_Z)
 
-            # 5) Rayleigh-Ritz in expanded metric-orthonormal subspace
-            H_Z = _metric_symmetrize(_metric_gram(grid, backend, Z, HZ, scale))
-            E_Z, V_Z = jnp.linalg.eigh(H_Z)
+        X = Z @ V_Z[:, :n_bands]
+        HX = HZ @ V_Z[:, :n_bands]
+        E = E_Z[:n_bands]
 
-            X_new = Z @ V_Z[:, :n_bands]
-            HX_new = HZ @ V_Z[:, :n_bands]
-            E_new = E_Z[:n_bands]
+        # 6) Residual after update
+        R_new = HX - X * E[None, :]
+        res_vec_new = _metric_block_norms(grid, backend, R_new, scale)
+        res_norm = jnp.max(res_vec_new)
+        i += 1
 
-            # 6) Residual after update
-            R_new = HX_new - X_new * E_new[None, :]
-            res_vec_new = _metric_block_norms(grid, backend, R_new, scale)
-            res_norm_new = jnp.max(res_vec_new)
-
-            return i + 1, X_new, HX_new, E_new, res_norm_new
-
-        return jax.lax.cond(res_norm <= tol, done_branch, expand_branch, operand=None)
-
-    state0 = (
-        jnp.array(0, dtype=jnp.int32),
-        X,
-        HX,
-        jnp.full((n_bands,), jnp.inf, dtype=jnp.float32),
-        jnp.array(jnp.inf, dtype=jnp.float32),
-    )
-
-    _, X_final, _, E_final, _ = jax.lax.while_loop(cond_fun, body_fun, state0)
-    return E_final, X_final
+    return E, X
 
 def solve_orbitals_lobpcg(*args, **kwargs):
     """
@@ -395,15 +379,21 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
 
         # Subspace eigensolver with residual-based convergence
         iter_key = jax.random.fold_in(key, i)
+        metric_backend = backend if getattr(backend, "name", None) != "uniform" else None
+        metric_grid = grid if metric_backend is not None else None
+        orbital_max_iter = 30 if metric_backend is None else 8
+        orbital_tol = 1e-5 if metric_backend is None else 1e-4
         eigvals, eigvecs = solve_orbitals_subspace(
-    apply_h,
-    n_grid,
-    n_bands,
-    x_init=eigvecs0,
-    max_iter=30,
-    tol=1e-5,
-    key=iter_key,
-)
+            apply_h,
+            n_grid,
+            n_bands,
+            x_init=eigvecs0,
+            max_iter=orbital_max_iter,
+            tol=orbital_tol,
+            key=iter_key,
+            grid=metric_grid,
+            backend=metric_backend,
+        )
         
         # 归一化
         eigvec_fields = jnp.moveaxis(eigvecs.reshape(grid.shape + (n_bands,)), -1, 0)
@@ -419,10 +409,13 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         return i + 1, rho_flat.reshape(grid.shape), f_hist_cur, diff, eigvals, eigvecs, V_H, eps_xc, v_xc
 
     state0 = (i0, rho, f_hist, diff0, eigvals0, eigvecs0, V_H0, eps_xc0, v_xc0)
-    final_state = jax.lax.while_loop(cond, body, state0)
-    
-    # 停止梯度并取回结果
-    final_state = jax.lax.stop_gradient(final_state)
+    if getattr(backend, "name", None) == "uniform":
+        final_state = jax.lax.while_loop(cond, body, state0)
+        final_state = jax.lax.stop_gradient(final_state)
+    else:
+        final_state = state0
+        while bool(cond(final_state)):
+            final_state = body(final_state)
     _, rho, _, diff, eigvals, eigvecs, V_H, eps_xc, v_xc = final_state
     
     return rho, eigvals, eigvecs, V_H, eps_xc, v_xc
