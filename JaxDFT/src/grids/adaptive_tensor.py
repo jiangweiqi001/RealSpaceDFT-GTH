@@ -1,8 +1,8 @@
 """Adaptive tensor-product grid helpers for future nonuniform backends.
 
-Patch A/B intentionally stays below the SCF layer. It provides 1D adaptive axes,
-nodal integration weights, tensor-product volume weights, and a minimal 3D grid
-state without modifying any existing solver execution path.
+This module stays below the SCF layer. It provides 1D adaptive axes, nodal
+integration weights, tensor-product volume weights, a minimal 3D grid state,
+and a prototype variable-spacing second-order Laplacian.
 """
 
 from __future__ import annotations
@@ -34,6 +34,10 @@ class AdaptiveTensorGrid:
                 f"inner_product expects shapes {self.shape}, got x={x.shape}, y={y.shape}"
             )
         return self.integrate(jnp.conjugate(x) * y)
+
+    def laplacian(self, field: Array) -> Array:
+        """Apply the prototype adaptive tensor-product Laplacian."""
+        return laplacian_nonuniform_3d(self, field)
 
 
 def make_reference_axis(
@@ -159,6 +163,80 @@ def build_volume_weights(wx: Array, wy: Array, wz: Array) -> Array:
     if wx.size < 2 or wy.size < 2 or wz.size < 2:
         raise ValueError("Each 1D weight array must contain at least two nodes")
     return wx[:, None, None] * wy[None, :, None] * wz[None, None, :]
+
+
+def _quadratic_second_derivative_from_triplet(axis_triplet: Array, values_triplet: Array) -> Array:
+    """Return the second derivative of the quadratic interpolant through three points."""
+    x0, x1, x2 = axis_triplet[0], axis_triplet[1], axis_triplet[2]
+    c0 = 2.0 / ((x0 - x1) * (x0 - x2))
+    c1 = 2.0 / ((x1 - x0) * (x1 - x2))
+    c2 = 2.0 / ((x2 - x0) * (x2 - x1))
+    return c0 * values_triplet[0] + c1 * values_triplet[1] + c2 * values_triplet[2]
+
+
+def second_derivative_nonuniform_1d(axis: Array, values: Array) -> Array:
+    """Apply a variable-spacing three-point second-derivative stencil.
+
+    Interior points use
+        f''(x_i) ~= 2 / (h_- + h_+) * [ (f_{i+1} - f_i)/h_+ - (f_i - f_{i-1})/h_- ]
+    with h_- = x_i - x_{i-1} and h_+ = x_{i+1} - x_i.
+
+    Boundary points use the second derivative of the quadratic interpolant
+    through the first/last three nodes.
+    """
+    axis = jnp.asarray(axis, dtype=jnp.float32).reshape(-1)
+    values = jnp.asarray(values)
+
+    if axis.size < 3:
+        raise ValueError("axis must contain at least three nodes for a second derivative")
+    if values.shape[0] != axis.size:
+        raise ValueError(f"values.shape[0]={values.shape[0]} does not match axis size {axis.size}")
+
+    diffs = axis[1:] - axis[:-1]
+    if bool(jnp.any(diffs <= 0.0)):
+        raise ValueError("axis must be strictly increasing")
+
+    left = _quadratic_second_derivative_from_triplet(axis[:3], values[:3])
+    right = _quadratic_second_derivative_from_triplet(axis[-3:], values[-3:])
+
+    out = jnp.zeros_like(values)
+    out = out.at[0].set(left)
+    out = out.at[-1].set(right)
+
+    if axis.size > 2:
+        hm = axis[1:-1] - axis[:-2]
+        hp = axis[2:] - axis[1:-1]
+        reshape = (-1,) + (1,) * (values.ndim - 1)
+        hm = hm.reshape(reshape)
+        hp = hp.reshape(reshape)
+        interior = 2.0 * ((values[2:] - values[1:-1]) / hp - (values[1:-1] - values[:-2]) / hm) / (hm + hp)
+        out = out.at[1:-1].set(interior)
+
+    return out
+
+
+def second_derivative_along_axis(field: Array, axis_coords: Array, axis: int) -> Array:
+    """Apply the 1D nonuniform second derivative along one tensor-product axis."""
+    field = jnp.asarray(field)
+    moved = jnp.moveaxis(field, axis, 0)
+    d2 = second_derivative_nonuniform_1d(axis_coords, moved)
+    return jnp.moveaxis(d2, 0, axis)
+
+
+def laplacian_nonuniform_3d(grid: AdaptiveTensorGrid, field: Array) -> Array:
+    """Apply the prototype tensor-product Laplacian on an adaptive grid."""
+    field = jnp.asarray(field)
+    if field.shape != grid.shape:
+        raise ValueError(f"field shape {field.shape} does not match grid shape {grid.shape}")
+
+    lap = (
+        second_derivative_along_axis(field, grid.x, axis=0)
+        + second_derivative_along_axis(field, grid.y, axis=1)
+        + second_derivative_along_axis(field, grid.z, axis=2)
+    )
+    if getattr(grid, 'mask', None) is not None:
+        lap = lap * grid.mask
+    return lap
 
 
 def create_adaptive_axis(
@@ -312,6 +390,9 @@ def create_adaptive_grid(
     grid.x = x
     grid.y = y
     grid.z = z
+    grid.hx = x[1:] - x[:-1]
+    grid.hy = y[1:] - y[:-1]
+    grid.hz = z[1:] - z[:-1]
     grid.wx = wx
     grid.wy = wy
     grid.wz = wz
@@ -344,4 +425,7 @@ __all__ = [
     "create_adaptive_grid",
     "compute_axis_weights",
     "build_volume_weights",
+    "second_derivative_nonuniform_1d",
+    "second_derivative_along_axis",
+    "laplacian_nonuniform_3d",
 ]
