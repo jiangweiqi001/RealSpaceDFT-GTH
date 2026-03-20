@@ -1,10 +1,10 @@
-﻿"""Backend interfaces for JaxDFT.
+"""Backend interfaces for JaxDFT.
 
-Patch 2 exports a concrete ``UniformBackend`` wrapper, but existing runtime
-code paths remain unchanged until a later patch explicitly wires a backend
-into the solver.
+This package exports concrete backend wrappers while keeping solver wiring under
+explicit user-controlled milestones.
 """
 
+from .adaptive import AdaptiveBackend
 from .base import ArrayLike, Backend, BackendState, NonlocalCache
 from .uniform import UniformBackend
 
@@ -14,4 +14,5 @@ __all__ = [
     "BackendState",
     "NonlocalCache",
     "UniformBackend",
+    "AdaptiveBackend",
 ]
