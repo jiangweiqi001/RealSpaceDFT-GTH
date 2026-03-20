@@ -75,6 +75,7 @@ def create_grid(spacing, box_size, policy="preserve_box", tol=1e-8):
     grid.volume_element = grid.spacing ** 3
     grid.mask = jnp.ones(grid.shape, dtype=jnp.float32)
     grid.projectors = []
+    grid.backend_name = "uniform"
 
     # 调试信息，方便你检查输入和实际采用值
     grid.requested_spacing = jnp.asarray(spacing, dtype=jnp.float32)
