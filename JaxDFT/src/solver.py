@@ -53,7 +53,7 @@ def _metric_orthonormalize(grid, backend, X, scale, eps=1e-8):
     evals, evecs = jnp.linalg.eigh(S)
     eps = jnp.asarray(eps, dtype=evals.dtype)
     safe_evals = jnp.maximum(evals, eps)
-    inv_sqrt = jnp.where(evals > eps, 1.0 / jnp.sqrt(safe_evals), 0.0)
+    inv_sqrt = 1.0 / jnp.sqrt(safe_evals)
     return X @ (evecs * inv_sqrt[None, :])
 
 
@@ -91,9 +91,9 @@ def solve_orbitals_subspace(
         max_i ||H psi_i - eps_i psi_i||_2
     falls below tol.
 
-    The optional ``grid`` and ``backend`` arguments reserve a future entry point
-    for a weighted-metric subspace solver. Patch 2 keeps the current Euclidean
-    algorithm unchanged unless later patches explicitly switch to those helpers.
+    When ``grid`` and ``backend`` are both provided, the solver uses the
+    backend-aware weighted metric defined by ``backend.inner_product``.
+    Otherwise it falls back to the original Euclidean implementation.
     """
     if key is None:
         key = jax.random.PRNGKey(42)
@@ -101,16 +101,86 @@ def solve_orbitals_subspace(
     if (grid is None) != (backend is None):
         raise ValueError(
             "solve_orbitals_subspace expects both grid and backend together "
-            "for the future metric-aware path"
+            "for the metric-aware path"
         )
+
+    metric_enabled = grid is not None and backend is not None
 
     if x_init is None:
         X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
     else:
         X = x_init + 1e-6 * jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
 
-    # Initial orthonormalization
-    X = jnp.linalg.qr(X)[0]
+    if not metric_enabled:
+        # Initial orthonormalization
+        X = jnp.linalg.qr(X)[0]
+        HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
+
+        def cond_fun(state):
+            i, _, _, _, res_norm = state
+            return jnp.logical_and(i < max_iter, res_norm > tol)
+
+        def body_fun(state):
+            i, X, HX, _, _ = state
+
+            # 1) Rayleigh-Ritz in current subspace
+            H_sub = X.T @ HX
+            H_sub = 0.5 * (H_sub + H_sub.T)   # numerical symmetrization
+            E, V_sub = jnp.linalg.eigh(H_sub)
+
+            X = X @ V_sub
+            HX = HX @ V_sub
+
+            # 2) Residual in current subspace
+            R = HX - X * E[None, :]
+            res_vec = jnp.sqrt(jnp.sum(R * R, axis=0))
+            res_norm = jnp.max(res_vec)
+
+            def done_branch(_):
+                return i + 1, X, HX, E, res_norm
+
+            def expand_branch(_):
+                # 3) Orthogonalize residuals against current subspace
+                R_ortho = R - X @ (X.T @ R)
+                R_ortho = jnp.linalg.qr(R_ortho)[0]
+
+                # 4) Expand subspace
+                HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R_ortho)
+
+                Z = jnp.concatenate([X, R_ortho], axis=1)
+                HZ = jnp.concatenate([HX, HR], axis=1)
+
+                # 5) Rayleigh-Ritz in expanded subspace
+                H_Z = Z.T @ HZ
+                H_Z = 0.5 * (H_Z + H_Z.T)
+                E_Z, V_Z = jnp.linalg.eigh(H_Z)
+
+                X_new = Z @ V_Z[:, :n_bands]
+                HX_new = HZ @ V_Z[:, :n_bands]
+                E_new = E_Z[:n_bands]
+
+                # 6) Residual after update
+                R_new = HX_new - X_new * E_new[None, :]
+                res_vec_new = jnp.sqrt(jnp.sum(R_new * R_new, axis=0))
+                res_norm_new = jnp.max(res_vec_new)
+
+                return i + 1, X_new, HX_new, E_new, res_norm_new
+
+            return jax.lax.cond(res_norm <= tol, done_branch, expand_branch, operand=None)
+
+        state0 = (
+            jnp.array(0, dtype=jnp.int32),
+            X,
+            HX,
+            jnp.full((n_bands,), jnp.inf, dtype=jnp.float32),
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        )
+
+        _, X_final, _, E_final, _ = jax.lax.while_loop(cond_fun, body_fun, state0)
+        return E_final, X_final
+
+    scale = _metric_scale(grid, backend)
+    X = _metric_orthonormalize(grid, backend, X, scale)
     HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
 
     def cond_fun(state):
@@ -120,9 +190,8 @@ def solve_orbitals_subspace(
     def body_fun(state):
         i, X, HX, _, _ = state
 
-        # 1) Rayleigh-Ritz in current subspace
-        H_sub = X.T @ HX
-        H_sub = 0.5 * (H_sub + H_sub.T)   # numerical symmetrization
+        # 1) Rayleigh-Ritz in current metric-orthonormal subspace
+        H_sub = _metric_symmetrize(_metric_gram(grid, backend, X, HX, scale))
         E, V_sub = jnp.linalg.eigh(H_sub)
 
         X = X @ V_sub
@@ -130,26 +199,24 @@ def solve_orbitals_subspace(
 
         # 2) Residual in current subspace
         R = HX - X * E[None, :]
-        res_vec = jnp.sqrt(jnp.sum(R * R, axis=0))
+        res_vec = _metric_block_norms(grid, backend, R, scale)
         res_norm = jnp.max(res_vec)
 
         def done_branch(_):
             return i + 1, X, HX, E, res_norm
 
         def expand_branch(_):
-            # 3) Orthogonalize residuals against current subspace
-            R_ortho = R - X @ (X.T @ R)
-            R_ortho = jnp.linalg.qr(R_ortho)[0]
+            # 3) Orthogonalize residuals against current subspace in metric W
+            R_ortho = _metric_project_out(grid, backend, X, R, scale)
+            R_ortho = _metric_orthonormalize(grid, backend, R_ortho, scale)
 
-            # 4) Expand subspace
-            HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R_ortho)
-
+            # 4) Expand and re-orthonormalize the full subspace for stability
             Z = jnp.concatenate([X, R_ortho], axis=1)
-            HZ = jnp.concatenate([HX, HR], axis=1)
+            Z = _metric_orthonormalize(grid, backend, Z, scale)
+            HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
 
-            # 5) Rayleigh-Ritz in expanded subspace
-            H_Z = Z.T @ HZ
-            H_Z = 0.5 * (H_Z + H_Z.T)
+            # 5) Rayleigh-Ritz in expanded metric-orthonormal subspace
+            H_Z = _metric_symmetrize(_metric_gram(grid, backend, Z, HZ, scale))
             E_Z, V_Z = jnp.linalg.eigh(H_Z)
 
             X_new = Z @ V_Z[:, :n_bands]
@@ -158,7 +225,7 @@ def solve_orbitals_subspace(
 
             # 6) Residual after update
             R_new = HX_new - X_new * E_new[None, :]
-            res_vec_new = jnp.sqrt(jnp.sum(R_new * R_new, axis=0))
+            res_vec_new = _metric_block_norms(grid, backend, R_new, scale)
             res_norm_new = jnp.max(res_vec_new)
 
             return i + 1, X_new, HX_new, E_new, res_norm_new
@@ -175,7 +242,6 @@ def solve_orbitals_subspace(
 
     _, X_final, _, E_final, _ = jax.lax.while_loop(cond_fun, body_fun, state0)
     return E_final, X_final
-
 
 def solve_orbitals_lobpcg(*args, **kwargs):
     """
