@@ -524,6 +524,220 @@ def build_monopole_dirichlet_faces(
     return faces, diagnostics
 
 
+def _precompute_uniform_exterior_poisson_kernel(grid_shape: tuple[int, int, int], spacing: float) -> jnp.ndarray:
+    """Precompute the zero-padded FFT Poisson kernel used for the auxiliary uniform exterior grid."""
+    nx, ny, nz = (int(n) for n in grid_shape)
+    x = jnp.fft.fftfreq(2 * nx, d=1.0 / (2 * nx)) * spacing
+    y = jnp.fft.fftfreq(2 * ny, d=1.0 / (2 * ny)) * spacing
+    z = jnp.fft.fftfreq(2 * nz, d=1.0 / (2 * nz)) * spacing
+    kx, ky, kz = jnp.meshgrid(x, y, z, indexing="ij")
+    r = jnp.sqrt(kx**2 + ky**2 + kz**2)
+    kernel = jnp.where(r > 1.0e-8, 1.0 / r, 2.38 / spacing)
+    return jnp.fft.fftn(kernel)
+
+
+def _solve_uniform_exterior_poisson(rho: Array, spacing: float) -> jnp.ndarray:
+    """Solve the auxiliary uniform-grid free-space-like Hartree problem via zero-padded FFT."""
+    rho_arr = jnp.asarray(rho)
+    nx, ny, nz = (int(n) for n in rho_arr.shape)
+    kernel_k = _precompute_uniform_exterior_poisson_kernel((nx, ny, nz), float(spacing))
+    rho_pad = jnp.pad(rho_arr, ((0, nx), (0, ny), (0, nz)), mode="constant")
+    rho_k = jnp.fft.fftn(rho_pad)
+    v_pad = jnp.fft.ifftn(rho_k * kernel_k).real * (spacing**3)
+    return v_pad[:nx, :ny, :nz]
+
+
+def _build_uniform_axis_with_padding(vmin: float, vmax: float, spacing: float) -> np.ndarray:
+    """Build a uniform axis that covers [vmin, vmax] with exact spacing and symmetric overhang."""
+    if spacing <= 0.0:
+        raise ValueError("spacing must be positive")
+    if vmax <= vmin:
+        raise ValueError("axis upper bound must exceed lower bound")
+    length = float(vmax - vmin)
+    n_intervals = max(int(np.ceil(length / spacing)), 1)
+    total_length = n_intervals * spacing
+    overhang = 0.5 * (total_length - length)
+    start = float(vmin) - overhang
+    return start + spacing * np.arange(n_intervals + 1, dtype=np.float64)
+
+
+def _build_uniform_exterior_axes(grid, *, padding: float = 8.0, dx_ext: float = 0.8) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
+    """Construct the padded auxiliary uniform grid used to provide adaptive Dirichlet face values."""
+    if padding <= 0.0:
+        raise ValueError("padding must be positive")
+    if dx_ext <= 0.0:
+        raise ValueError("dx_ext must be positive")
+
+    x = _build_uniform_axis_with_padding(float(grid.x[0]) - padding, float(grid.x[-1]) + padding, dx_ext)
+    y = _build_uniform_axis_with_padding(float(grid.y[0]) - padding, float(grid.y[-1]) + padding, dx_ext)
+    z = _build_uniform_axis_with_padding(float(grid.z[0]) - padding, float(grid.z[-1]) + padding, dx_ext)
+    diagnostics = {
+        "padding": float(padding),
+        "dx_ext": float(dx_ext),
+        "shape_ext": (int(x.size), int(y.size), int(z.size)),
+        "x_bounds": (float(x[0]), float(x[-1])),
+        "y_bounds": (float(y[0]), float(y[-1])),
+        "z_bounds": (float(z[0]), float(z[-1])),
+    }
+    return x, y, z, diagnostics
+
+
+def _uniform_axis_cell_indices(points: np.ndarray, axis: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return lower-cell indices and fractional coordinates for a uniform 1D axis."""
+    origin = float(axis[0])
+    spacing = float(axis[1] - axis[0])
+    n_nodes = int(axis.size)
+    raw = np.floor((points - origin) / spacing).astype(np.int64)
+    idx0 = np.clip(raw, 0, n_nodes - 2)
+    base = origin + spacing * idx0
+    frac = np.clip((points - base) / spacing, 0.0, 1.0)
+    return idx0, frac
+
+
+def _deposit_trilinear_to_uniform(points: np.ndarray, charges: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple[np.ndarray, dict[str, float | tuple[int, int, int]]]:
+    """Deposit point charges onto a node-centered uniform grid using trilinear weights."""
+    rho = np.zeros((x.size, y.size, z.size), dtype=np.float64)
+    ix, tx = _uniform_axis_cell_indices(points[:, 0], x)
+    iy, ty = _uniform_axis_cell_indices(points[:, 1], y)
+    iz, tz = _uniform_axis_cell_indices(points[:, 2], z)
+
+    wx = (1.0 - tx, tx)
+    wy = (1.0 - ty, ty)
+    wz = (1.0 - tz, tz)
+    dv = float((x[1] - x[0]) * (y[1] - y[0]) * (z[1] - z[0]))
+    density_scale = charges / dv
+
+    for ox, wx_part in enumerate(wx):
+        for oy, wy_part in enumerate(wy):
+            for oz, wz_part in enumerate(wz):
+                np.add.at(
+                    rho,
+                    (ix + ox, iy + oy, iz + oz),
+                    density_scale * wx_part * wy_part * wz_part,
+                )
+
+    charge_in = float(np.sum(charges))
+    charge_out = float(np.sum(rho) * dv)
+    rel_err = abs(charge_out - charge_in) / max(abs(charge_in), 1.0e-12)
+    diagnostics = {
+        "charge_in": charge_in,
+        "charge_deposited": charge_out,
+        "relative_charge_error": rel_err,
+        "shape_ext": (int(x.size), int(y.size), int(z.size)),
+    }
+    return rho, diagnostics
+
+
+def _interpolate_trilinear_from_uniform(field: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """Trilinearly interpolate a node-centered uniform scalar field at arbitrary points."""
+    ix, tx = _uniform_axis_cell_indices(points[:, 0], x)
+    iy, ty = _uniform_axis_cell_indices(points[:, 1], y)
+    iz, tz = _uniform_axis_cell_indices(points[:, 2], z)
+
+    wx = (1.0 - tx, tx)
+    wy = (1.0 - ty, ty)
+    wz = (1.0 - tz, tz)
+    values = np.zeros(points.shape[0], dtype=np.float64)
+
+    for ox, wx_part in enumerate(wx):
+        for oy, wy_part in enumerate(wy):
+            for oz, wz_part in enumerate(wz):
+                values += field[ix + ox, iy + oy, iz + oz] * wx_part * wy_part * wz_part
+    return values
+
+
+def build_uniform_exterior_dirichlet_faces(
+    grid,
+    rho: Array,
+    *,
+    padding: float = 8.0,
+    dx_ext: float = 0.8,
+) -> tuple[dict[str, jnp.ndarray], dict[str, Array | float | tuple[int, int, int] | str]]:
+    """Build Dirichlet face values from a padded coarse uniform exterior free-space solve.
+
+    This keeps the adaptive interior operator unchanged. The adaptive density is
+    first deposited onto a larger, coarser auxiliary uniform grid via trilinear
+    deposition, a free-space-like Hartree potential is computed on that uniform
+    grid, and the resulting potential is trilinearly interpolated back to the
+    six adaptive box faces.
+    """
+    rho_arr = jnp.asarray(rho)
+    expected_shape = tuple(int(n) for n in grid.shape)
+    if rho_arr.shape != expected_shape:
+        raise ValueError(f"rho shape {rho_arr.shape} does not match grid shape {expected_shape}")
+
+    x_ext, y_ext, z_ext, ext_diag = _build_uniform_exterior_axes(grid, padding=padding, dx_ext=dx_ext)
+    coords = np.asarray(grid.coords, dtype=np.float64).reshape(-1, 3)
+    charges = np.asarray(jnp.asarray(grid.volume_weights) * rho_arr, dtype=np.float64).reshape(-1)
+    rho_ext, deposit_diag = _deposit_trilinear_to_uniform(coords, charges, x_ext, y_ext, z_ext)
+    v_ext = np.asarray(_solve_uniform_exterior_poisson(jnp.asarray(rho_ext, dtype=jnp.float32), float(dx_ext)), dtype=np.float64)
+
+    x = np.asarray(grid.x, dtype=np.float64)
+    y = np.asarray(grid.y, dtype=np.float64)
+    z = np.asarray(grid.z, dtype=np.float64)
+    x_int = x[1:-1]
+    y_int = y[1:-1]
+    z_int = z[1:-1]
+
+    y_grid_x, z_grid_x = np.meshgrid(y_int, z_int, indexing="ij")
+    x_grid_y, z_grid_y = np.meshgrid(x_int, z_int, indexing="ij")
+    x_grid_z, y_grid_z = np.meshgrid(x_int, y_int, indexing="ij")
+
+    def face_values(x_face, y_face, z_face):
+        pts = np.stack([x_face.reshape(-1), y_face.reshape(-1), z_face.reshape(-1)], axis=-1)
+        vals = _interpolate_trilinear_from_uniform(v_ext, x_ext, y_ext, z_ext, pts)
+        return vals.reshape(x_face.shape)
+
+    faces_np = {
+        "x_lo": face_values(np.full_like(y_grid_x, x[0]), y_grid_x, z_grid_x),
+        "x_hi": face_values(np.full_like(y_grid_x, x[-1]), y_grid_x, z_grid_x),
+        "y_lo": face_values(x_grid_y, np.full_like(x_grid_y, y[0]), z_grid_y),
+        "y_hi": face_values(x_grid_y, np.full_like(x_grid_y, y[-1]), z_grid_y),
+        "z_lo": face_values(x_grid_z, y_grid_z, np.full_like(x_grid_z, z[0])),
+        "z_hi": face_values(x_grid_z, y_grid_z, np.full_like(x_grid_z, z[-1])),
+    }
+    faces = {key: jnp.asarray(val, dtype=jnp.float32) for key, val in faces_np.items()}
+
+    diagnostics = {
+        "boundary_model": "uniform_exterior_dirichlet",
+        "padding": float(padding),
+        "dx_ext": float(dx_ext),
+        "shape_ext": ext_diag["shape_ext"],
+        "x_bounds_ext": ext_diag["x_bounds"],
+        "y_bounds_ext": ext_diag["y_bounds"],
+        "z_bounds_ext": ext_diag["z_bounds"],
+        "total_charge": compute_total_charge(grid, rho_arr),
+        "charge_in": deposit_diag["charge_in"],
+        "charge_deposited": deposit_diag["charge_deposited"],
+        "relative_charge_error": deposit_diag["relative_charge_error"],
+        "ext_potential_min": jnp.asarray(float(np.min(v_ext)), dtype=jnp.float32),
+        "ext_potential_max": jnp.asarray(float(np.max(v_ext)), dtype=jnp.float32),
+    }
+    return faces, diagnostics
+
+
+def solve_hartree_uniform_exterior_dirichlet_3d(
+    grid,
+    rho: Array,
+    *,
+    padding: float = 8.0,
+    dx_ext: float = 0.8,
+) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
+    """Solve the prototype Hartree problem using an auxiliary uniform exterior boundary provider."""
+    rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
+    faces, face_diagnostics = build_uniform_exterior_dirichlet_faces(
+        grid,
+        rho,
+        padding=padding,
+        dx_ext=dx_ext,
+    )
+    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces)
+    diagnostics = dict(diagnostics)
+    diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
+    diagnostics.update(face_diagnostics)
+    return V, diagnostics
+
+
 def solve_poisson_dirichlet_3d(
     grid,
     rhs: Array,
@@ -652,9 +866,11 @@ __all__ = [
     "get_boundary_reference_center",
     "build_multipole_dirichlet_faces",
     "build_monopole_dirichlet_faces",
+    "build_uniform_exterior_dirichlet_faces",
     "solve_poisson_dirichlet_1d",
     "solve_poisson_dirichlet_3d",
     "solve_hartree_dirichlet_3d",
     "solve_hartree_multipole_dirichlet_3d",
     "solve_hartree_monopole_dirichlet_3d",
+    "solve_hartree_uniform_exterior_dirichlet_3d",
 ]
