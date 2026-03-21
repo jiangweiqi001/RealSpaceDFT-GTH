@@ -5,9 +5,10 @@ already implemented below the SCF layer. The current Hartree path defaults to a
 multipole-Dirichlet box Poisson solve, which is still not an exact
 isolated/open-boundary treatment but is a further upgrade over the previous
 monopole and zero-Dirichlet prototypes. Explicit monopole and zero-Dirichlet
-fallbacks remain available for regression and debugging. The current nonlocal
-path reuses the existing pointwise projector tabulation but evaluates overlaps
-with adaptive volume weights.
+fallbacks remain available for regression and debugging. The monopole fallback
+now also supports choosing the reference center via ``hartree_center_mode``.
+The current nonlocal path reuses the existing pointwise projector tabulation but
+evaluates overlaps with adaptive volume weights.
 """
 
 from __future__ import annotations
@@ -49,14 +50,26 @@ class AdaptiveBackend:
 
     name = "adaptive_tensor"
 
-    def __init__(self, *, hartree_boundary_mode: str = "multipole_dirichlet"):
+    def __init__(
+        self,
+        *,
+        hartree_boundary_mode: str = "multipole_dirichlet",
+        hartree_center_mode: str = "box_center",
+    ):
         supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet"}
+        supported_center_modes = {"box_center", "charge_center"}
         if hartree_boundary_mode not in supported:
             raise ValueError(
                 f"unsupported hartree_boundary_mode {hartree_boundary_mode!r}; "
                 f"expected one of {sorted(supported)}"
             )
+        if hartree_center_mode not in supported_center_modes:
+            raise ValueError(
+                f"unsupported hartree_center_mode {hartree_center_mode!r}; "
+                f"expected one of {sorted(supported_center_modes)}"
+            )
         self.hartree_boundary_mode = hartree_boundary_mode
+        self.hartree_center_mode = hartree_center_mode
 
     def create_grid(self, spacing: float, box_size: ArrayLike, **kwargs) -> BackendState:
         """Create an adaptive tensor grid using spacing as the minimum spacing."""
@@ -144,13 +157,19 @@ class AdaptiveBackend:
         isolated-like than the older monopole and zero-Dirichlet box Poisson
         prototypes but is still not an exact isolated/open-boundary Hartree
         treatment. Explicit monopole and zero-Dirichlet fallbacks remain
-        available for regression and debugging.
+        available for regression and debugging. ``hartree_center_mode`` is
+        currently routed only to the monopole fallback so that the default
+        multipole behavior remains unchanged.
         """
         if self.hartree_boundary_mode == "multipole_dirichlet":
             V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho)
             return V_h
         if self.hartree_boundary_mode == "monopole_dirichlet":
-            V_h, _ = solve_hartree_monopole_dirichlet_3d(state, rho)
+            V_h, _ = solve_hartree_monopole_dirichlet_3d(
+                state,
+                rho,
+                center_mode=self.hartree_center_mode,
+            )
             return V_h
         if self.hartree_boundary_mode == "zero_dirichlet":
             V_h, _ = solve_hartree_dirichlet_3d(state, rho)

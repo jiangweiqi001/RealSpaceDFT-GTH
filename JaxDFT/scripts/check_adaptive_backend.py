@@ -2,9 +2,9 @@
 
 This script stays below the SCF layer. It verifies that the backend can create
 an adaptive grid and expose the currently implemented pointwise, weighted,
-Hartree, and nonlocal operations. The current Hartree default is a monopole
-Dirichlet box solve: more isolated-like than zero Dirichlet, but still not an
-exact isolated/open-boundary treatment.
+Hartree, and nonlocal operations. The current Hartree default is a multipole
+Dirichlet box solve: more isolated-like than the older monopole and zero-
+Dirichlet prototypes, but still not an exact isolated/open-boundary treatment.
 """
 
 from __future__ import annotations
@@ -38,6 +38,10 @@ def main() -> int:
     all_ok = True
 
     backend = AdaptiveBackend()
+    monopole_charge_backend = AdaptiveBackend(
+        hartree_boundary_mode="monopole_dirichlet",
+        hartree_center_mode="charge_center",
+    )
     coords = jnp.array([
         [-0.7, 0.0, 0.0],
         [0.7, 0.0, 0.0],
@@ -69,6 +73,13 @@ def main() -> int:
     )
     hartree_r2 = jnp.sum(hartree_grid.coords ** 2, axis=-1)
     rho = jnp.exp(-0.25 * hartree_r2)
+    shifted_rho = jnp.exp(
+        -0.25 * (
+            (hartree_grid.coords[..., 0] - 0.8) ** 2
+            + hartree_grid.coords[..., 1] ** 2
+            + hartree_grid.coords[..., 2] ** 2
+        )
+    )
 
     pseudo_dir = os.path.join(project_root, "JaxDFT", "data", "gth_potentials")
     pseudos = load_pseudopotentials(["H", "H"], pseudo_dir)
@@ -81,6 +92,7 @@ def main() -> int:
     v_loc = backend.build_local_potential(grid, coords, pseudos)
     kinetic = backend.apply_kinetic(grid, psi)
     v_h = backend.solve_hartree(hartree_grid, rho)
+    v_h_mono_charge = monopole_charge_backend.solve_hartree(hartree_grid, shifted_rho)
     nl_cache = backend.precompute_nonlocal(grid, nonlocal_atom_coords, nonlocal_pseudos)
     v_nl = backend.apply_nonlocal(grid, psi, nl_cache)
     kinetic_exact = -0.5 * (4.0 * alpha * alpha * r2 - 6.0 * alpha) * psi
@@ -98,7 +110,9 @@ def main() -> int:
     all_ok &= check("kinetic_shape", kinetic.shape == grid.shape, f"kinetic.shape={kinetic.shape}, grid.shape={grid.shape}")
     all_ok &= check("kinetic_finite", bool(jnp.all(jnp.isfinite(kinetic))), f"min={float(jnp.min(kinetic)):.6f}, max={float(jnp.max(kinetic)):.6f}")
     all_ok &= check("kinetic_rms", kinetic_rms <= 1.0e-2, f"rms={kinetic_rms:.6e}")
-    all_ok &= check("hartree_mode", getattr(backend, "hartree_boundary_mode", None) == "monopole_dirichlet", f"hartree_boundary_mode={getattr(backend, 'hartree_boundary_mode', None)}")
+    all_ok &= check("hartree_mode", getattr(backend, "hartree_boundary_mode", None) == "multipole_dirichlet", f"hartree_boundary_mode={getattr(backend, 'hartree_boundary_mode', None)}")
+    all_ok &= check("hartree_center_mode", getattr(backend, "hartree_center_mode", None) == "box_center", f"hartree_center_mode={getattr(backend, 'hartree_center_mode', None)}")
+    all_ok &= check("monopole_charge_center_mode", getattr(monopole_charge_backend, "hartree_center_mode", None) == "charge_center", f"hartree_center_mode={getattr(monopole_charge_backend, 'hartree_center_mode', None)}")
     all_ok &= check("hartree_shape", v_h.shape == hartree_grid.shape, f"V_H.shape={v_h.shape}, hartree_grid.shape={hartree_grid.shape}")
     all_ok &= check("hartree_finite", bool(jnp.all(jnp.isfinite(v_h))), f"min={float(jnp.min(v_h)):.6f}, max={float(jnp.max(v_h)):.6f}")
     all_ok &= check(
@@ -126,6 +140,8 @@ def main() -> int:
         "monopole Dirichlet interior-aligned faces are positive for positive rho",
     )
     all_ok &= check("hartree_positive_peak", float(jnp.max(v_h)) > 0.0, f"max={float(jnp.max(v_h)):.6f}")
+    all_ok &= check("monopole_charge_hartree_shape", v_h_mono_charge.shape == hartree_grid.shape, f"V_H_charge.shape={v_h_mono_charge.shape}, hartree_grid.shape={hartree_grid.shape}")
+    all_ok &= check("monopole_charge_hartree_finite", bool(jnp.all(jnp.isfinite(v_h_mono_charge))), f"min={float(jnp.min(v_h_mono_charge)):.6f}, max={float(jnp.max(v_h_mono_charge)):.6f}")
     all_ok &= check("nonlocal_cache_present", nl_cache is not None, f"cache_is_none={nl_cache is None}")
     if nl_cache is not None:
         p_i, p_j, coeffs = nl_cache
@@ -141,6 +157,7 @@ def main() -> int:
     print(f"<1,1>={inner:.6f}")
     print(f"V_loc[min,max]=({float(jnp.min(v_loc)):.6f}, {float(jnp.max(v_loc)):.6f})")
     print(f"V_H[min,max]=({float(jnp.min(v_h)):.6f}, {float(jnp.max(v_h)):.6f})")
+    print(f"V_H_charge[min,max]=({float(jnp.min(v_h_mono_charge)):.6f}, {float(jnp.max(v_h_mono_charge)):.6f})")
     print(f"V_nl[min,max]=({float(jnp.min(v_nl)):.6f}, {float(jnp.max(v_nl)):.6f})")
     print(f"kinetic_rms={kinetic_rms:.6e}")
 
