@@ -15,6 +15,25 @@ from .backends.uniform import (
 from .functional import lda_xc
 
 
+def _dirichlet_project_field(grid, field):
+    """Project a field onto the grid's Dirichlet mask when present."""
+    mask = getattr(grid, "mask", None)
+    if mask is None:
+        return field
+    field = jnp.asarray(field)
+    return field * jnp.asarray(mask, dtype=field.dtype)
+
+
+def _dirichlet_project_block(grid, block):
+    """Project each flattened column vector onto the grid's Dirichlet mask."""
+    mask = getattr(grid, "mask", None)
+    if mask is None:
+        return block
+    block = jnp.asarray(block)
+    mask_flat = jnp.asarray(mask, dtype=block.dtype).reshape((-1, 1))
+    return block * mask_flat
+
+
 def _metric_scale(grid, backend):
     """Return a normalization scale for backend-aware inner products.
 
@@ -180,8 +199,11 @@ def solve_orbitals_subspace(
         return E_final, X_final
 
     scale = _metric_scale(grid, backend)
+    X = _dirichlet_project_block(grid, X)
     X = _metric_orthonormalize(grid, backend, X, scale)
+    X = _dirichlet_project_block(grid, X)
     HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
+    HX = _dirichlet_project_block(grid, HX)
     E = jnp.full((n_bands,), jnp.inf, dtype=jnp.float32)
     res_norm = jnp.array(jnp.inf, dtype=jnp.float32)
     i = 0
@@ -193,9 +215,12 @@ def solve_orbitals_subspace(
 
         X = X @ V_sub
         HX = HX @ V_sub
+        X = _dirichlet_project_block(grid, X)
+        HX = _dirichlet_project_block(grid, HX)
 
         # 2) Residual in current subspace
         R = HX - X * E[None, :]
+        R = _dirichlet_project_block(grid, R)
         res_vec = _metric_block_norms(grid, backend, R, scale)
         res_norm = jnp.max(res_vec)
         if float(res_norm) <= tol:
@@ -204,12 +229,17 @@ def solve_orbitals_subspace(
 
         # 3) Orthogonalize residuals against current subspace in metric W
         R_ortho = _metric_project_out(grid, backend, X, R, scale)
+        R_ortho = _dirichlet_project_block(grid, R_ortho)
         R_ortho = _metric_orthonormalize(grid, backend, R_ortho, scale)
+        R_ortho = _dirichlet_project_block(grid, R_ortho)
 
         # 4) Expand and re-orthonormalize the full subspace for stability
         Z = jnp.concatenate([X, R_ortho], axis=1)
+        Z = _dirichlet_project_block(grid, Z)
         Z = _metric_orthonormalize(grid, backend, Z, scale)
+        Z = _dirichlet_project_block(grid, Z)
         HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
+        HZ = _dirichlet_project_block(grid, HZ)
 
         # 5) Rayleigh-Ritz in expanded metric-orthonormal subspace
         H_Z = _metric_symmetrize(_metric_gram(grid, backend, Z, HZ, scale))
@@ -217,10 +247,13 @@ def solve_orbitals_subspace(
 
         X = Z @ V_Z[:, :n_bands]
         HX = HZ @ V_Z[:, :n_bands]
+        X = _dirichlet_project_block(grid, X)
+        HX = _dirichlet_project_block(grid, HX)
         E = E_Z[:n_bands]
 
         # 6) Residual after update
         R_new = HX - X * E[None, :]
+        R_new = _dirichlet_project_block(grid, R_new)
         res_vec_new = _metric_block_norms(grid, backend, R_new, scale)
         res_norm = jnp.max(res_vec_new)
         i += 1
@@ -341,6 +374,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     for a in range(coords.shape[0]):
         r = jnp.linalg.norm(grid.coords - coords[a], axis=-1)
         rho = rho + jnp.exp(-2.0 * r**2)
+    rho = _dirichlet_project_field(grid, rho)
     rho = rho / backend.integrate(grid, rho) * jnp.sum(occ)
 
     f_hist = jnp.zeros((5, rho.size), dtype=jnp.float32)
@@ -362,6 +396,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     def body(state):
         i, rho_cur, f_hist_cur, diff, _, eigvecs0, V_H_prev, _, _ = state
         rho_cur = jnp.clip(rho_cur, 1e-12, None)
+        rho_cur = _dirichlet_project_field(grid, rho_cur)
         
 
         V_H = backend.solve_hartree(grid, rho_cur)
@@ -371,10 +406,12 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
 
         def apply_h(psi_flat):
             psi = psi_flat.reshape(grid.shape)
+            psi = _dirichlet_project_field(grid, psi)
             kinetic_psi = backend.apply_kinetic(grid, psi)
             v_nonlocal = backend.apply_nonlocal(grid, psi, proj_data)
 
             hpsi = kinetic_psi + V_eff * psi + v_nonlocal # ?????????
+            hpsi = _dirichlet_project_field(grid, hpsi)
             return hpsi.reshape(-1)
 
         # Subspace eigensolver with residual-based convergence
@@ -396,17 +433,21 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         )
         
         # 归一化
+        eigvecs = _dirichlet_project_block(grid, eigvecs)
         eigvec_fields = jnp.moveaxis(eigvecs.reshape(grid.shape + (n_bands,)), -1, 0)
         norm = jnp.sqrt(jax.vmap(lambda psi: backend.inner_product(grid, psi, psi))(eigvec_fields))
         eigvecs = eigvecs / norm[None, :]
+        eigvecs = _dirichlet_project_block(grid, eigvecs)
         
         rho_new = jnp.sum((eigvecs ** 2) * occ[None, :], axis=1).reshape(grid.shape)
+        rho_new = _dirichlet_project_field(grid, rho_new)
         diff = jnp.max(jnp.abs(rho_new - rho_cur))
         
         rho_flat, f_hist_cur = anderson_mixing(
             rho_cur.reshape(-1), rho_new.reshape(-1), f_hist_cur, mix_alpha, i
         )
-        return i + 1, rho_flat.reshape(grid.shape), f_hist_cur, diff, eigvals, eigvecs, V_H, eps_xc, v_xc
+        rho_mixed = _dirichlet_project_field(grid, rho_flat.reshape(grid.shape))
+        return i + 1, rho_mixed, f_hist_cur, diff, eigvals, eigvecs, V_H, eps_xc, v_xc
 
     state0 = (i0, rho, f_hist, diff0, eigvals0, eigvecs0, V_H0, eps_xc0, v_xc0)
     if getattr(backend, "name", None) == "uniform":
