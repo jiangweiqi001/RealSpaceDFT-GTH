@@ -3,8 +3,8 @@
 This is a lightweight diagnostic study, not a final benchmark. The adaptive
 Hartree path currently offers two box-Poisson boundary choices:
   - zero_dirichlet
-  - monopole_dirichlet
-The monopole variant is more isolated-like than zero Dirichlet, but still not
+  - multipole_dirichlet
+The multipole variant is more isolated-like than zero Dirichlet, but still not
 an exact isolated/open-boundary Hartree treatment.
 
 The current adaptive SCF path still uses the conservative Python ``while`` loop
@@ -50,7 +50,7 @@ QUICK_DISTANCES = [1.4]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Adaptive H2 boundary diagnostic: zero-Dirichlet vs monopole-Dirichlet vs PySCF."
+        description="Adaptive H2 boundary diagnostic: zero-Dirichlet vs multipole-Dirichlet vs PySCF."
     )
     parser.add_argument(
         "--dist",
@@ -122,7 +122,7 @@ def main() -> int:
     pseudos_for_calc = [pseudos[0], pseudos[0]]
 
     backend_zero = AdaptiveBackend(hartree_boundary_mode="zero_dirichlet")
-    backend_mono = AdaptiveBackend(hartree_boundary_mode="monopole_dirichlet")
+    backend_multi = AdaptiveBackend(hartree_boundary_mode="multipole_dirichlet")
     key = jax.random.PRNGKey(42)
 
     mode_label = "full reduced set (--all)" if args.all else ("user-specified --dist" if args.dist else "default quick mode")
@@ -133,19 +133,19 @@ def main() -> int:
     )
     print(f"Mode: {mode_label}; distances={distances}")
     print("Note: this is not a final benchmark.")
-    print("Note: adaptive monopole-Dirichlet is still not an exact isolated/open-boundary Hartree treatment.")
+    print("Note: adaptive multipole-Dirichlet is still not an exact isolated/open-boundary Hartree treatment.")
     print("Note: the goal here is to diagnose boundary sensitivity, not to force exact agreement with uniform or PySCF.")
     print("Note: SCF settings are intentionally relaxed for speed in this reduced diagnostic script.")
     print("Note: for fixed geometry the adaptive grid is static across SCF iterations; the current Python while-loop path is a conservative solver choice, not a geometry-change requirement.")
 
     zero_energies = []
-    mono_energies = []
+    multi_energies = []
     pyscf_energies = []
 
     print("-" * 120)
     print(
         f"{'Dist':<6} | {'PySCF':<14} | {'Adaptive Zero':<14} | {'Err Zero':<12} | "
-        f"{'Adaptive Mono':<14} | {'Err Mono':<12} | {'Delta(M-Z)':<12}"
+        f"{'Adaptive Multi':<14} | {'Err Multi':<12} | {'Delta(Multi-Z)':<14}"
     )
     print("-" * 120)
 
@@ -192,11 +192,11 @@ def main() -> int:
             e_zero = float("nan")
             print(f"--- Zero Dirichlet SCF failed for d={d:.2f}: {exc} ---")
 
-        print(f"--- Starting Monopole Dirichlet SCF for d={d:.2f} ---")
+        print(f"--- Starting Multipole Dirichlet SCF for d={d:.2f} ---")
         try:
             if state is None:
                 raise RuntimeError("adaptive grid state was not created")
-            e_mono, _ = energy_and_forces(
+            e_multi, _ = energy_and_forces(
                 state,
                 coords,
                 pseudos_for_calc,
@@ -204,37 +204,37 @@ def main() -> int:
                 mix_alpha,
                 tolerance,
                 dist_key,
-                backend=backend_mono,
+                backend=backend_multi,
             )
-            e_mono = float(e_mono)
-            print(f"--- Finished Monopole Dirichlet SCF for d={d:.2f}; E={e_mono:.6f} ---")
+            e_multi = float(e_multi)
+            print(f"--- Finished Multipole Dirichlet SCF for d={d:.2f}; E={e_multi:.6f} ---")
         except Exception as exc:
-            e_mono = float("nan")
-            print(f"--- Monopole Dirichlet SCF failed for d={d:.2f}: {exc} ---")
+            e_multi = float("nan")
+            print(f"--- Multipole Dirichlet SCF failed for d={d:.2f}: {exc} ---")
 
         print(f"--- Starting PySCF reference for d={d:.2f} ---")
         e_pyscf = run_pyscf(d, box_size=None)
         print(f"--- Finished PySCF reference for d={d:.2f}; E={e_pyscf:.6f} ---")
 
         zero_energies.append(e_zero)
-        mono_energies.append(e_mono)
+        multi_energies.append(e_multi)
         pyscf_energies.append(e_pyscf)
 
         err_zero = e_zero - e_pyscf
-        err_mono = e_mono - e_pyscf
-        delta_mz = e_mono - e_zero
+        err_multi = e_multi - e_pyscf
+        delta_mz = e_multi - e_zero
         print(
             f"{d:<6.2f} | {e_pyscf:<14.6f} | {e_zero:<14.6f} | {err_zero:<12.4f} | "
-            f"{e_mono:<14.6f} | {err_mono:<12.4f} | {delta_mz:<12.4f}"
+            f"{e_multi:<14.6f} | {err_multi:<12.4f} | {delta_mz:<14.4f}"
         )
 
     plt.figure(figsize=(10, 6))
     plt.plot(distances, zero_energies, "s--", label="JaxDFT (Adaptive, zero Dirichlet)", linewidth=2)
-    plt.plot(distances, mono_energies, "o-", label="JaxDFT (Adaptive, monopole Dirichlet)", linewidth=2)
+    plt.plot(distances, multi_energies, "o-", label="JaxDFT (Adaptive, multipole Dirichlet)", linewidth=2)
     plt.plot(distances, pyscf_energies, "x:", label="PySCF (TZVP Reference)", linewidth=2)
     plt.xlabel("Bond Length (Bohr)")
     plt.ylabel("Total Energy (Hartree)")
-    plt.title("H2 Boundary Diagnostic: Adaptive Hartree Modes vs PySCF")
+    plt.title("H2 Boundary Diagnostic: Adaptive Multipole Hartree vs PySCF")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig("h2_adaptive_verification.png", dpi=150)

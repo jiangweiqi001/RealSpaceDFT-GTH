@@ -2,12 +2,12 @@
 
 This backend intentionally exposes only the adaptive-grid capabilities that are
 already implemented below the SCF layer. The current Hartree path defaults to a
-monopole-Dirichlet box Poisson solve, which is still not an exact
-isolated/open-boundary treatment but is a first upgrade over the previous
-zero-Dirichlet prototype. An explicit zero-Dirichlet fallback remains available
-for regression and debugging. The current nonlocal path reuses the existing
-pointwise projector tabulation but evaluates overlaps with adaptive volume
-weights.
+multipole-Dirichlet box Poisson solve, which is still not an exact
+isolated/open-boundary treatment but is a further upgrade over the previous
+monopole and zero-Dirichlet prototypes. Explicit monopole and zero-Dirichlet
+fallbacks remain available for regression and debugging. The current nonlocal
+path reuses the existing pointwise projector tabulation but evaluates overlaps
+with adaptive volume weights.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from .base import ArrayLike, BackendState, NonlocalCache
 from ..grids.adaptive_poisson import (
     assemble_poisson_operator_3d,
     solve_hartree_dirichlet_3d,
+    solve_hartree_multipole_dirichlet_3d,
     solve_hartree_monopole_dirichlet_3d,
 )
 from ..grids.adaptive_tensor import create_adaptive_grid as create_adaptive_grid_state
@@ -48,8 +49,8 @@ class AdaptiveBackend:
 
     name = "adaptive_tensor"
 
-    def __init__(self, *, hartree_boundary_mode: str = "monopole_dirichlet"):
-        supported = {"monopole_dirichlet", "zero_dirichlet"}
+    def __init__(self, *, hartree_boundary_mode: str = "multipole_dirichlet"):
+        supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet"}
         if hartree_boundary_mode not in supported:
             raise ValueError(
                 f"unsupported hartree_boundary_mode {hartree_boundary_mode!r}; "
@@ -139,11 +140,15 @@ class AdaptiveBackend:
     def solve_hartree(self, state: BackendState, rho: ArrayLike) -> ArrayLike:
         """Solve Hartree with the current adaptive box-Poisson prototype.
 
-        The default path uses monopole Dirichlet boundary data, which is more
-        isolated-like than zero Dirichlet but still not an exact
-        isolated/open-boundary Hartree treatment. The previous zero-Dirichlet
-        prototype remains available via ``hartree_boundary_mode='zero_dirichlet'``.
+        The default path uses multipole Dirichlet boundary data, which is more
+        isolated-like than the older monopole and zero-Dirichlet box Poisson
+        prototypes but is still not an exact isolated/open-boundary Hartree
+        treatment. Explicit monopole and zero-Dirichlet fallbacks remain
+        available for regression and debugging.
         """
+        if self.hartree_boundary_mode == "multipole_dirichlet":
+            V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho)
+            return V_h
         if self.hartree_boundary_mode == "monopole_dirichlet":
             V_h, _ = solve_hartree_monopole_dirichlet_3d(state, rho)
             return V_h

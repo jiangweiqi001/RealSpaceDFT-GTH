@@ -246,6 +246,46 @@ def compute_total_charge(grid, rho: Array) -> jnp.ndarray:
     return jnp.sum(rho_arr * volume_weights)
 
 
+def compute_dipole_moment(grid, rho: Array, r0: Array) -> jnp.ndarray:
+    """Compute the dipole moment p_i = integral rho (x_i - r0_i) dV."""
+    rho_arr = jnp.asarray(rho)
+    coords = jnp.asarray(grid.coords)
+    volume_weights = jnp.asarray(grid.volume_weights)
+    expected_shape = tuple(int(n) for n in grid.shape)
+    if rho_arr.shape != expected_shape:
+        raise ValueError(f"rho shape {rho_arr.shape} does not match grid shape {expected_shape}")
+    if coords.shape != expected_shape + (3,):
+        raise ValueError(f"grid.coords shape {coords.shape} does not match expected shape {expected_shape + (3,)}")
+    r0_arr = jnp.asarray(r0, dtype=coords.dtype).reshape(3)
+    rel = coords - r0_arr
+    return jnp.sum(rho_arr[..., None] * rel * volume_weights[..., None], axis=(0, 1, 2))
+
+
+def compute_quadrupole_tensor(grid, rho: Array, r0: Array) -> jnp.ndarray:
+    """Compute the traceless quadrupole tensor.
+
+    Q_ij = integral rho * [3 (x_i-r0_i)(x_j-r0_j) - |r-r0|^2 delta_ij] dV
+    """
+    rho_arr = jnp.asarray(rho)
+    coords = jnp.asarray(grid.coords)
+    volume_weights = jnp.asarray(grid.volume_weights)
+    expected_shape = tuple(int(n) for n in grid.shape)
+    if rho_arr.shape != expected_shape:
+        raise ValueError(f"rho shape {rho_arr.shape} does not match grid shape {expected_shape}")
+    if coords.shape != expected_shape + (3,):
+        raise ValueError(f"grid.coords shape {coords.shape} does not match expected shape {expected_shape + (3,)}")
+    r0_arr = jnp.asarray(r0, dtype=coords.dtype).reshape(3)
+    rel = coords - r0_arr
+    r2 = jnp.sum(rel * rel, axis=-1)
+    rel_outer = rel[..., :, None] * rel[..., None, :]
+    identity = jnp.eye(3, dtype=coords.dtype)
+    tensor_field = 3.0 * rel_outer - r2[..., None, None] * identity
+    return jnp.sum(
+        rho_arr[..., None, None] * tensor_field * volume_weights[..., None, None],
+        axis=(0, 1, 2),
+    )
+
+
 def get_boundary_reference_center(grid, rho: Array | None = None, center_mode: str = "box_center") -> jnp.ndarray:
     """Return the reference center used for asymptotic boundary data.
 
@@ -266,6 +306,86 @@ def get_boundary_reference_center(grid, rho: Array | None = None, center_mode: s
     )
 
 
+def build_multipole_dirichlet_faces(
+    grid,
+    rho: Array,
+    *,
+    r0: Array | None = None,
+    center_mode: str = "box_center",
+    min_radius: float = 1.0e-8,
+) -> tuple[dict[str, jnp.ndarray], dict[str, Array | str]]:
+    """Build multipole asymptotic Dirichlet face data for the adaptive Hartree solve.
+
+    The boundary potential uses the first three multipole terms around ``r0``:
+        V(R) = Q / R + (p . R) / R^3 + 0.5 * sum_ij Q_ij R_i R_j / R^5
+    where Q is total charge, p is the dipole moment, and Q_ij is the traceless
+    quadrupole tensor.
+    """
+    if min_radius <= 0.0:
+        raise ValueError("min_radius must be positive")
+
+    if r0 is None:
+        r0_arr = get_boundary_reference_center(grid, rho=rho, center_mode=center_mode)
+    else:
+        r0_arr = jnp.asarray(r0, dtype=jnp.float32).reshape(-1)
+        if r0_arr.size != 3:
+            raise ValueError("r0 must contain exactly three coordinates")
+        if not bool(jnp.all(jnp.isfinite(r0_arr))):
+            raise ValueError("r0 must contain only finite values")
+
+    Q = compute_total_charge(grid, rho)
+    dipole = compute_dipole_moment(grid, rho, r0_arr)
+    quadrupole = compute_quadrupole_tensor(grid, rho, r0_arr)
+
+    x = jnp.asarray(grid.x)
+    y = jnp.asarray(grid.y)
+    z = jnp.asarray(grid.z)
+    x_int = x[1:-1]
+    y_int = y[1:-1]
+    z_int = z[1:-1]
+    min_radius_arr = jnp.asarray(min_radius, dtype=x.dtype)
+
+    def multipole_values(x_face, y_face, z_face):
+        R = jnp.stack(
+            [
+                x_face - r0_arr[0],
+                y_face - r0_arr[1],
+                z_face - r0_arr[2],
+            ],
+            axis=-1,
+        )
+        radius = jnp.sqrt(jnp.sum(R * R, axis=-1))
+        radius_safe = jnp.maximum(radius, min_radius_arr)
+        monopole = Q / radius_safe
+        dipole_term = jnp.sum(dipole * R, axis=-1) / (radius_safe ** 3)
+        quadrupole_projection = jnp.einsum('...i,ij,...j->...', R, quadrupole, R)
+        quadrupole_term = 0.5 * quadrupole_projection / (radius_safe ** 5)
+        return monopole + dipole_term + quadrupole_term
+
+    y_grid_x, z_grid_x = jnp.meshgrid(y_int, z_int, indexing="ij")
+    x_grid_y, z_grid_y = jnp.meshgrid(x_int, z_int, indexing="ij")
+    x_grid_z, y_grid_z = jnp.meshgrid(x_int, y_int, indexing="ij")
+
+    faces = {
+        "x_lo": multipole_values(jnp.full_like(y_grid_x, x[0]), y_grid_x, z_grid_x),
+        "x_hi": multipole_values(jnp.full_like(y_grid_x, x[-1]), y_grid_x, z_grid_x),
+        "y_lo": multipole_values(x_grid_y, jnp.full_like(x_grid_y, y[0]), z_grid_y),
+        "y_hi": multipole_values(x_grid_y, jnp.full_like(x_grid_y, y[-1]), z_grid_y),
+        "z_lo": multipole_values(x_grid_z, y_grid_z, jnp.full_like(x_grid_z, z[0])),
+        "z_hi": multipole_values(x_grid_z, y_grid_z, jnp.full_like(x_grid_z, z[-1])),
+    }
+    diagnostics = {
+        "boundary_model": "multipole_dirichlet",
+        "center_mode": center_mode,
+        "total_charge": Q,
+        "dipole_moment": dipole,
+        "quadrupole_tensor": quadrupole,
+        "reference_center": r0_arr,
+        "min_radius": min_radius_arr,
+    }
+    return faces, diagnostics
+
+
 def build_monopole_dirichlet_faces(
     grid,
     rho: Array,
@@ -274,12 +394,7 @@ def build_monopole_dirichlet_faces(
     center_mode: str = "box_center",
     min_radius: float = 1.0e-8,
 ) -> tuple[dict[str, jnp.ndarray], dict[str, Array | str]]:
-    """Build monopole asymptotic Dirichlet face data for the adaptive Hartree solve.
-
-    The first implementation uses
-        V_boundary(r) = Q / |r - r0|
-    with Q computed from ``rho`` and ``r0`` defaulting to the box center.
-    """
+    """Backward-compatible monopole face builder retained for regression."""
     if min_radius <= 0.0:
         raise ValueError("min_radius must be positive")
 
@@ -302,8 +417,8 @@ def build_monopole_dirichlet_faces(
     min_radius_arr = jnp.asarray(min_radius, dtype=x.dtype)
 
     def monopole_values(x_face, y_face, z_face):
-        r = jnp.sqrt((x_face - r0_arr[0]) ** 2 + (y_face - r0_arr[1]) ** 2 + (z_face - r0_arr[2]) ** 2)
-        return Q / jnp.maximum(r, min_radius_arr)
+        radius = jnp.sqrt((x_face - r0_arr[0]) ** 2 + (y_face - r0_arr[1]) ** 2 + (z_face - r0_arr[2]) ** 2)
+        return Q / jnp.maximum(radius, min_radius_arr)
 
     y_grid_x, z_grid_x = jnp.meshgrid(y_int, z_int, indexing="ij")
     x_grid_y, z_grid_y = jnp.meshgrid(x_int, z_int, indexing="ij")
@@ -393,6 +508,30 @@ def solve_hartree_dirichlet_3d(grid, rho: Array) -> tuple[jnp.ndarray, dict[str,
     return V, diagnostics
 
 
+def solve_hartree_multipole_dirichlet_3d(
+    grid,
+    rho: Array,
+    *,
+    r0: Array | None = None,
+    center_mode: str = "box_center",
+    min_radius: float = 1.0e-8,
+) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
+    """Solve the prototype Hartree problem using multipole Dirichlet boundary data."""
+    rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
+    faces, face_diagnostics = build_multipole_dirichlet_faces(
+        grid,
+        rho,
+        r0=r0,
+        center_mode=center_mode,
+        min_radius=min_radius,
+    )
+    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces)
+    diagnostics = dict(diagnostics)
+    diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
+    diagnostics.update(face_diagnostics)
+    return V, diagnostics
+
+
 def solve_hartree_monopole_dirichlet_3d(
     grid,
     rho: Array,
@@ -401,7 +540,7 @@ def solve_hartree_monopole_dirichlet_3d(
     center_mode: str = "box_center",
     min_radius: float = 1.0e-8,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
-    """Solve the prototype Hartree problem using monopole Dirichlet boundary data."""
+    """Backward-compatible monopole Hartree wrapper retained for regression."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
     faces, face_diagnostics = build_monopole_dirichlet_faces(
         grid,
@@ -425,10 +564,14 @@ __all__ = [
     "assemble_poisson_operator_3d",
     "build_dirichlet_boundary_load_3d",
     "compute_total_charge",
+    "compute_dipole_moment",
+    "compute_quadrupole_tensor",
     "get_boundary_reference_center",
+    "build_multipole_dirichlet_faces",
     "build_monopole_dirichlet_faces",
     "solve_poisson_dirichlet_1d",
     "solve_poisson_dirichlet_3d",
     "solve_hartree_dirichlet_3d",
+    "solve_hartree_multipole_dirichlet_3d",
     "solve_hartree_monopole_dirichlet_3d",
 ]
