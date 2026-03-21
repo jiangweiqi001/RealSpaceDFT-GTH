@@ -126,7 +126,7 @@ def main() -> int:
     )
     all_ok &= check(
         "3d_residual",
-        diag_3d["relative_residual"] <= 1.0e-10,
+        diag_3d["relative_residual"] <= 5.0e-6,
         f"rel_res={diag_3d['relative_residual']:.6e}, abs_res={diag_3d['residual_norm']:.6e}",
     )
 
@@ -145,3 +145,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -399,7 +399,14 @@ def create_adaptive_grid(
     grid.volume_weights = volume_weights
     grid.coords = coords
     grid.shape = coords.shape[:-1]
-    grid.mask = jnp.ones(grid.shape, dtype=jnp.float32)
+    mask = jnp.ones(grid.shape, dtype=jnp.float32)
+    mask = mask.at[0, :, :].set(0.0)
+    mask = mask.at[-1, :, :].set(0.0)
+    mask = mask.at[:, 0, :].set(0.0)
+    mask = mask.at[:, -1, :].set(0.0)
+    mask = mask.at[:, :, 0].set(0.0)
+    mask = mask.at[:, :, -1].set(0.0)
+    grid.mask = mask
     grid.box_size = box_size.reshape(3)
     grid.backend_name = "adaptive_tensor"
     grid.projectors = []
