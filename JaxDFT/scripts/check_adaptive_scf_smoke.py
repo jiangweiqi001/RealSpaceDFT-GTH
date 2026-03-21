@@ -89,7 +89,7 @@ def main() -> int:
     norms = jax.vmap(lambda psi: backend.inner_product(grid, psi, psi))(eigvec_fields)
 
     print("=== Adaptive SCF Smoke Test ===")
-    print("Note: adaptive Hartree currently uses a monopole-Dirichlet box Poisson prototype.")
+    print("Note: adaptive Hartree currently uses a multipole-Dirichlet box Poisson prototype.")
     print("Note: this is still not an exact isolated/open-boundary Hartree path, and this smoke test is not a physical uniform-vs-adaptive benchmark.")
 
     all_ok &= check("grid_shape", grid.coords.shape[:-1] == grid.shape, f"coords.shape={grid.coords.shape}, shape={grid.shape}")

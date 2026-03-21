@@ -23,6 +23,7 @@ from ..grids.adaptive_poisson import (
     solve_hartree_dirichlet_3d,
     solve_hartree_multipole_dirichlet_3d,
     solve_hartree_monopole_dirichlet_3d,
+    solve_hartree_uniform_exterior_dirichlet_3d,
 )
 from ..grids.adaptive_tensor import create_adaptive_grid as create_adaptive_grid_state
 from ..hamiltonian import (
@@ -56,7 +57,7 @@ class AdaptiveBackend:
         hartree_boundary_mode: str = "multipole_dirichlet",
         hartree_center_mode: str = "box_center",
     ):
-        supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet"}
+        supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet", "uniform_exterior"}
         supported_center_modes = {"box_center", "charge_center"}
         if hartree_boundary_mode not in supported:
             raise ValueError(
@@ -156,10 +157,13 @@ class AdaptiveBackend:
         The default path uses multipole Dirichlet boundary data, which is more
         isolated-like than the older monopole and zero-Dirichlet box Poisson
         prototypes but is still not an exact isolated/open-boundary Hartree
-        treatment. Explicit monopole and zero-Dirichlet fallbacks remain
-        available for regression and debugging. ``hartree_center_mode`` is
-        currently routed only to the monopole fallback so that the default
-        multipole behavior remains unchanged.
+        treatment. An experimental ``uniform_exterior`` fallback is also
+        available; it preserves the adaptive interior operator and obtains face
+        data from a larger coarse uniform auxiliary free-space-like solve.
+        Explicit monopole and zero-Dirichlet fallbacks remain available for
+        regression and debugging. ``hartree_center_mode`` is currently routed
+        only to the monopole fallback so that the default multipole behavior
+        remains unchanged.
         """
         if self.hartree_boundary_mode == "multipole_dirichlet":
             V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho)
@@ -173,6 +177,9 @@ class AdaptiveBackend:
             return V_h
         if self.hartree_boundary_mode == "zero_dirichlet":
             V_h, _ = solve_hartree_dirichlet_3d(state, rho)
+            return V_h
+        if self.hartree_boundary_mode == "uniform_exterior":
+            V_h, _ = solve_hartree_uniform_exterior_dirichlet_3d(state, rho)
             return V_h
         raise ValueError(f"unsupported hartree_boundary_mode {self.hartree_boundary_mode!r}")
 
