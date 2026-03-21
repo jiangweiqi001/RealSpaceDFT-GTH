@@ -50,6 +50,15 @@ def _as_numpy_face(face: Array, expected_shape: tuple[int, int], name: str) -> n
     return arr
 
 
+def _as_numpy_point(point: Array, name: str) -> np.ndarray:
+    arr = np.asarray(point, dtype=np.float64).reshape(-1)
+    if arr.size != 3:
+        raise ValueError(f"{name} must contain exactly three coordinates")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values")
+    return arr
+
+
 def _coerce_boundary_faces_3d(grid, boundary_faces: dict[str, Array] | None) -> dict[str, np.ndarray]:
     nx, ny, nz = (int(n) for n in grid.shape)
     expected_shapes = {
@@ -231,6 +240,98 @@ def build_dirichlet_boundary_load_3d(grid, boundary_faces: dict[str, Array]) -> 
     return np.ascontiguousarray(load).reshape(-1, order="C")
 
 
+def compute_total_charge(grid, rho: Array) -> float:
+    """Compute total charge Q = integral rho dV using adaptive volume weights."""
+    rho_arr = np.asarray(rho, dtype=np.float64)
+    volume_weights = np.asarray(grid.volume_weights, dtype=np.float64)
+    expected_shape = tuple(int(n) for n in grid.shape)
+    if rho_arr.shape != expected_shape:
+        raise ValueError(f"rho shape {rho_arr.shape} does not match grid shape {expected_shape}")
+    if volume_weights.shape != expected_shape:
+        raise ValueError(
+            f"grid.volume_weights shape {volume_weights.shape} does not match grid shape {expected_shape}"
+        )
+    return float(np.sum(rho_arr * volume_weights))
+
+
+def get_boundary_reference_center(grid, rho: Array | None = None, center_mode: str = "box_center") -> jnp.ndarray:
+    """Return the reference center used for asymptotic boundary data.
+
+    Patch 2 keeps the first implementation deliberately conservative: the
+    supported reference center is the box center only.
+    """
+    if center_mode != "box_center":
+        raise ValueError(
+            f"unsupported center_mode {center_mode!r}; Patch 2 only supports 'box_center'"
+        )
+    center = np.array(
+        [
+            0.5 * (float(grid.x[0]) + float(grid.x[-1])),
+            0.5 * (float(grid.y[0]) + float(grid.y[-1])),
+            0.5 * (float(grid.z[0]) + float(grid.z[-1])),
+        ],
+        dtype=np.float64,
+    )
+    return jnp.asarray(center, dtype=jnp.float32)
+
+
+def build_monopole_dirichlet_faces(
+    grid,
+    rho: Array,
+    *,
+    r0: Array | None = None,
+    center_mode: str = "box_center",
+    min_radius: float = 1.0e-8,
+) -> tuple[dict[str, jnp.ndarray], dict[str, float | str | tuple[float, float, float]]]:
+    """Build monopole asymptotic Dirichlet face data for the adaptive Hartree solve.
+
+    The first implementation uses
+        V_boundary(r) = Q / |r - r0|
+    with Q computed from ``rho`` and ``r0`` defaulting to the box center.
+    """
+    if min_radius <= 0.0:
+        raise ValueError("min_radius must be positive")
+
+    Q = compute_total_charge(grid, rho)
+    if r0 is None:
+        r0_np = np.asarray(get_boundary_reference_center(grid, rho=rho, center_mode=center_mode), dtype=np.float64)
+    else:
+        r0_np = _as_numpy_point(r0, "r0")
+
+    x = _as_numpy_1d(grid.x, "grid.x")
+    y = _as_numpy_1d(grid.y, "grid.y")
+    z = _as_numpy_1d(grid.z, "grid.z")
+    x_int = x[1:-1]
+    y_int = y[1:-1]
+    z_int = z[1:-1]
+
+    def monopole_values(x_face, y_face, z_face):
+        r = np.sqrt((x_face - r0_np[0]) ** 2 + (y_face - r0_np[1]) ** 2 + (z_face - r0_np[2]) ** 2)
+        return Q / np.maximum(r, min_radius)
+
+    y_grid_x, z_grid_x = np.meshgrid(y_int, z_int, indexing="ij")
+    x_grid_y, z_grid_y = np.meshgrid(x_int, z_int, indexing="ij")
+    x_grid_z, y_grid_z = np.meshgrid(x_int, y_int, indexing="ij")
+
+    faces_np = {
+        "x_lo": monopole_values(np.full_like(y_grid_x, x[0]), y_grid_x, z_grid_x),
+        "x_hi": monopole_values(np.full_like(y_grid_x, x[-1]), y_grid_x, z_grid_x),
+        "y_lo": monopole_values(x_grid_y, np.full_like(x_grid_y, y[0]), z_grid_y),
+        "y_hi": monopole_values(x_grid_y, np.full_like(x_grid_y, y[-1]), z_grid_y),
+        "z_lo": monopole_values(x_grid_z, y_grid_z, np.full_like(x_grid_z, z[0])),
+        "z_hi": monopole_values(x_grid_z, y_grid_z, np.full_like(x_grid_z, z[-1])),
+    }
+    faces = {key: jnp.asarray(value, dtype=jnp.float32) for key, value in faces_np.items()}
+    diagnostics = {
+        "boundary_model": "monopole_dirichlet",
+        "center_mode": center_mode,
+        "total_charge": float(Q),
+        "reference_center": (float(r0_np[0]), float(r0_np[1]), float(r0_np[2])),
+        "min_radius": float(min_radius),
+    }
+    return faces, diagnostics
+
+
 def solve_poisson_dirichlet_3d(
     grid,
     rhs: Array,
@@ -281,6 +382,30 @@ def solve_hartree_dirichlet_3d(grid, rho: Array) -> tuple[jnp.ndarray, dict[str,
     return V, diagnostics
 
 
+def solve_hartree_monopole_dirichlet_3d(
+    grid,
+    rho: Array,
+    *,
+    r0: Array | None = None,
+    center_mode: str = "box_center",
+    min_radius: float = 1.0e-8,
+) -> tuple[jnp.ndarray, dict[str, float | int | str | tuple[float, float, float]]]:
+    """Solve the prototype Hartree problem using monopole Dirichlet boundary data."""
+    rhs = 4.0 * np.pi * np.asarray(rho, dtype=np.float64)
+    faces, face_diagnostics = build_monopole_dirichlet_faces(
+        grid,
+        rho,
+        r0=r0,
+        center_mode=center_mode,
+        min_radius=min_radius,
+    )
+    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces)
+    diagnostics = dict(diagnostics)
+    diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
+    diagnostics.update(face_diagnostics)
+    return V, diagnostics
+
+
 __all__ = [
     "build_poisson_1d_stiffness",
     "build_poisson_1d_mass",
@@ -288,7 +413,11 @@ __all__ = [
     "unflatten_interior_3d",
     "assemble_poisson_operator_3d",
     "build_dirichlet_boundary_load_3d",
+    "compute_total_charge",
+    "get_boundary_reference_center",
+    "build_monopole_dirichlet_faces",
     "solve_poisson_dirichlet_1d",
     "solve_poisson_dirichlet_3d",
     "solve_hartree_dirichlet_3d",
+    "solve_hartree_monopole_dirichlet_3d",
 ]
