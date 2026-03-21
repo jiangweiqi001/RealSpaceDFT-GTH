@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import sparse as jsparse
 
 from .base import ArrayLike, BackendState, NonlocalCache
 from ..grids.adaptive_poisson import (
+    assemble_poisson_operator_3d,
     solve_hartree_dirichlet_3d,
     solve_hartree_monopole_dirichlet_3d,
 )
@@ -87,8 +89,14 @@ class AdaptiveBackend:
         stretch_beta: float,
         **kwargs,
     ) -> BackendState:
-        """Create the adaptive tensor-grid state explicitly."""
-        return create_adaptive_grid_state(
+        """Create the adaptive tensor-grid state explicitly.
+
+        The Poisson operator depends only on the grid geometry, so we assemble it
+        once here and cache JAX BCOO versions on the returned state. This keeps
+        the SCF loop from rebuilding large SciPy sparse matrices on every Hartree
+        solve.
+        """
+        state = create_adaptive_grid_state(
             box_size,
             atom_coords,
             h_min,
@@ -97,6 +105,12 @@ class AdaptiveBackend:
             stretch_beta,
             **kwargs,
         )
+        A, M = assemble_poisson_operator_3d(state)
+        state.A_bcoo = jsparse.BCOO.from_scipy_sparse(A)
+        state.M_bcoo = jsparse.BCOO.from_scipy_sparse(M)
+        state.A_nnz = int(A.nnz)
+        state.M_nnz = int(M.nnz)
+        return state
 
     def integrate(self, state: BackendState, field: ArrayLike) -> ArrayLike:
         """Integrate a scalar field on the adaptive tensor grid."""
