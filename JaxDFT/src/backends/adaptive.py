@@ -1,23 +1,59 @@
 """Adaptive tensor-grid backend wrapper for the prototype nonuniform discretization.
 
 This backend intentionally exposes only the adaptive-grid capabilities that are
-already implemented below the SCF layer. Hartree and nonlocal overlap support
-remain explicitly unsupported in this milestone.
+already implemented below the SCF layer. The current Hartree path defaults to a
+monopole-Dirichlet box Poisson solve, which is still not an exact
+isolated/open-boundary treatment but is a first upgrade over the previous
+zero-Dirichlet prototype. An explicit zero-Dirichlet fallback remains available
+for regression and debugging. The current nonlocal path reuses the existing
+pointwise projector tabulation but evaluates overlaps with adaptive volume
+weights.
 """
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from .base import ArrayLike, BackendState, NonlocalCache
+from ..grids.adaptive_poisson import (
+    solve_hartree_dirichlet_3d,
+    solve_hartree_monopole_dirichlet_3d,
+)
 from ..grids.adaptive_tensor import create_adaptive_grid as create_adaptive_grid_state
-from ..hamiltonian import build_local_potential as build_local_potential_pointwise
+from ..hamiltonian import (
+    build_local_potential as build_local_potential_pointwise,
+    precompute_projectors,
+)
+
+
+@jax.jit
+def apply_nonlocal_weighted(
+    psi: ArrayLike,
+    p_i: ArrayLike,
+    p_j: ArrayLike,
+    coeffs: ArrayLike,
+    volume_weights: ArrayLike,
+) -> ArrayLike:
+    """Apply the nonlocal operator using adaptive weighted overlaps."""
+    overlap = jnp.sum(p_j * psi[None, ...] * volume_weights[None, ...], axis=(1, 2, 3))
+    weight = coeffs * overlap
+    return jnp.sum(weight[:, None, None, None] * p_i, axis=0)
 
 
 class AdaptiveBackend:
     """Thin wrapper over the prototype adaptive tensor-grid numerics."""
 
     name = "adaptive_tensor"
+
+    def __init__(self, *, hartree_boundary_mode: str = "monopole_dirichlet"):
+        supported = {"monopole_dirichlet", "zero_dirichlet"}
+        if hartree_boundary_mode not in supported:
+            raise ValueError(
+                f"unsupported hartree_boundary_mode {hartree_boundary_mode!r}; "
+                f"expected one of {sorted(supported)}"
+            )
+        self.hartree_boundary_mode = hartree_boundary_mode
 
     def create_grid(self, spacing: float, box_size: ArrayLike, **kwargs) -> BackendState:
         """Create an adaptive tensor grid using spacing as the minimum spacing."""
@@ -87,8 +123,20 @@ class AdaptiveBackend:
         return -0.5 * state.laplacian(psi)
 
     def solve_hartree(self, state: BackendState, rho: ArrayLike) -> ArrayLike:
-        """Adaptive Hartree support is not implemented in this milestone."""
-        raise NotImplementedError("Adaptive Hartree/Poisson support is not implemented yet")
+        """Solve Hartree with the current adaptive box-Poisson prototype.
+
+        The default path uses monopole Dirichlet boundary data, which is more
+        isolated-like than zero Dirichlet but still not an exact
+        isolated/open-boundary Hartree treatment. The previous zero-Dirichlet
+        prototype remains available via ``hartree_boundary_mode='zero_dirichlet'``.
+        """
+        if self.hartree_boundary_mode == "monopole_dirichlet":
+            V_h, _ = solve_hartree_monopole_dirichlet_3d(state, rho)
+            return V_h
+        if self.hartree_boundary_mode == "zero_dirichlet":
+            V_h, _ = solve_hartree_dirichlet_3d(state, rho)
+            return V_h
+        raise ValueError(f"unsupported hartree_boundary_mode {self.hartree_boundary_mode!r}")
 
     def precompute_nonlocal(
         self,
@@ -96,8 +144,8 @@ class AdaptiveBackend:
         atom_coords: ArrayLike,
         pseudos: ArrayLike,
     ) -> NonlocalCache:
-        """Adaptive nonlocal projector overlap support is not implemented yet."""
-        raise NotImplementedError("Adaptive nonlocal projector support is not implemented yet")
+        """Precompute pointwise projector tensors on adaptive-grid coordinates."""
+        return precompute_projectors(state, atom_coords, pseudos)
 
     def apply_nonlocal(
         self,
@@ -105,5 +153,8 @@ class AdaptiveBackend:
         psi: ArrayLike,
         cache: NonlocalCache,
     ) -> ArrayLike:
-        """Adaptive nonlocal projector overlap support is not implemented yet."""
-        raise NotImplementedError("Adaptive nonlocal projector support is not implemented yet")
+        """Apply the nonlocal operator using weighted adaptive-grid overlaps."""
+        if cache is None:
+            return jnp.zeros_like(psi)
+        p_i, p_j, coeffs = cache
+        return apply_nonlocal_weighted(psi, p_i, p_j, coeffs, state.volume_weights)

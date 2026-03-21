@@ -1,8 +1,10 @@
 """Minimal adaptive SCF smoke test.
 
 This is intentionally a smoke test, not a benchmark. The current adaptive
-Hartree path still uses a zero-Dirichlet box Poisson prototype, so the output
-must not be interpreted as a uniform-vs-adaptive physical comparison.
+Hartree path now defaults to a monopole-Dirichlet box Poisson prototype: more
+isolated-like than zero Dirichlet, but still not an exact isolated/open-boundary
+treatment. The output must not be interpreted as a formal uniform-vs-adaptive
+physical comparison.
 """
 
 from __future__ import annotations
@@ -87,8 +89,8 @@ def main() -> int:
     norms = jax.vmap(lambda psi: backend.inner_product(grid, psi, psi))(eigvec_fields)
 
     print("=== Adaptive SCF Smoke Test ===")
-    print("Note: adaptive Hartree currently uses a zero-Dirichlet box Poisson prototype.")
-    print("Note: this smoke test is not a physical uniform-vs-adaptive benchmark.")
+    print("Note: adaptive Hartree currently uses a monopole-Dirichlet box Poisson prototype.")
+    print("Note: this is still not an exact isolated/open-boundary Hartree path, and this smoke test is not a physical uniform-vs-adaptive benchmark.")
 
     all_ok &= check("grid_shape", grid.coords.shape[:-1] == grid.shape, f"coords.shape={grid.coords.shape}, shape={grid.shape}")
     all_ok &= check("rho_finite", bool(jnp.all(jnp.isfinite(rho))), f"rho[min,max]=({float(jnp.min(rho)):.6f}, {float(jnp.max(rho)):.6f})")

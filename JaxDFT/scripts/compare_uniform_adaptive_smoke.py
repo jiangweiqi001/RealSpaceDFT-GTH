@@ -1,9 +1,11 @@
 """Very conservative uniform-vs-adaptive SCF smoke comparison.
 
 This script is intentionally a smoke/stability check, not a benchmark.
-The current adaptive Hartree path still uses a zero-Dirichlet box Poisson
-prototype, so uniform and adaptive total energies must not be interpreted as a
-strict physical accuracy comparison. The more meaningful checks here are:
+The current adaptive Hartree path now defaults to a monopole-Dirichlet box
+Poisson prototype: more isolated-like than zero Dirichlet, but still not an
+exact isolated/open-boundary treatment. Uniform and adaptive total energies
+therefore must not be interpreted as a strict physical accuracy comparison. The
+more meaningful checks here are:
 - whether each tiny case runs to completion
 - whether the outputs stay finite and normalized
 - whether adaptive results vary smoothly when adaptive parameters are perturbed
@@ -241,8 +243,8 @@ def print_smoothness_table(rows):
 def main() -> int:
     print("=== Uniform vs Adaptive Smoke Comparison ===")
     print("Note: this is not a formal benchmark.")
-    print("Note: adaptive Hartree currently uses a zero-Dirichlet box Poisson prototype.")
-    print("Note: uniform_ref and adaptive_uniformlike must not be interpreted as a strict physical one-to-one energy comparison.")
+    print("Note: adaptive Hartree currently uses a monopole-Dirichlet box Poisson prototype.")
+    print("Note: uniform_ref and adaptive_uniformlike must not be interpreted as a strict physical one-to-one energy comparison, because the adaptive Hartree path is still only a first isolated-like upgrade.")
     print("Note: the key question here is whether tiny adaptive runs remain finite, normalized, and smooth under mild parameter changes.")
     print()
 
