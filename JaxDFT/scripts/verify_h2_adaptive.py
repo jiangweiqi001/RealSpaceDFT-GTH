@@ -17,6 +17,7 @@ That migration is intentionally out of scope for this script.
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 
@@ -41,6 +42,36 @@ except ImportError:
     from src.backends.adaptive import AdaptiveBackend
     from src.io import load_pseudopotentials
     from src.solver import energy_and_forces
+
+
+FULL_DISTANCES = [0.8, 1.4, 2.0, 2.8]
+QUICK_DISTANCES = [1.4]
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Adaptive H2 boundary diagnostic: zero-Dirichlet vs monopole-Dirichlet vs PySCF."
+    )
+    parser.add_argument(
+        "--dist",
+        type=float,
+        nargs="+",
+        help="Run one or more specific H-H distances in Bohr, e.g. --dist 2.0 or --dist 1.4 2.0",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run the full reduced diagnostic set: 0.8, 1.4, 2.0, 2.8 Bohr.",
+    )
+    return parser.parse_args()
+
+
+def select_distances(args: argparse.Namespace) -> list[float]:
+    if args.all:
+        return list(FULL_DISTANCES)
+    if args.dist:
+        return [float(d) for d in args.dist]
+    return list(QUICK_DISTANCES)
 
 
 def run_pyscf(dist, box_size=None):
@@ -72,6 +103,9 @@ def run_pyscf(dist, box_size=None):
 
 
 def main() -> int:
+    args = parse_args()
+    distances = select_distances(args)
+
     print(f"\n{'=' * 20} Adaptive H2 Boundary Diagnostic {'=' * 20}")
 
     box_size = [18.0, 18.0, 18.0]
@@ -82,7 +116,6 @@ def main() -> int:
     max_iter = 120
     mix_alpha = 0.30
     tolerance = 5.0e-4
-    distances = [0.8, 1.4, 2.0, 2.8]
 
     pseudo_dir = os.path.join(project_root, "JaxDFT", "data", "gth_potentials")
     pseudos = load_pseudopotentials(["H"], pseudo_dir)
@@ -92,11 +125,13 @@ def main() -> int:
     backend_mono = AdaptiveBackend(hartree_boundary_mode="monopole_dirichlet")
     key = jax.random.PRNGKey(42)
 
+    mode_label = "full reduced set (--all)" if args.all else ("user-specified --dist" if args.dist else "default quick mode")
     print(
         "Setup: "
         f"box={box_size}, h_min={h_min}, h_max={h_max}, "
         f"r_core={r_core}, stretch_beta={stretch_beta}"
     )
+    print(f"Mode: {mode_label}; distances={distances}")
     print("Note: this is not a final benchmark.")
     print("Note: adaptive monopole-Dirichlet is still not an exact isolated/open-boundary Hartree treatment.")
     print("Note: the goal here is to diagnose boundary sensitivity, not to force exact agreement with uniform or PySCF.")
@@ -122,6 +157,7 @@ def main() -> int:
         dist_key = jax.random.fold_in(key, idx)
         state = None
 
+        print(f"--- Building adaptive grid for d={d:.2f} Bohr ---")
         try:
             state = backend_zero.create_grid(
                 spacing=h_min,
@@ -132,6 +168,14 @@ def main() -> int:
                 r_core=r_core,
                 stretch_beta=stretch_beta,
             )
+            print(f"--- Adaptive grid ready for d={d:.2f}; shape={state.shape} ---")
+        except Exception as exc:
+            print(f"--- Adaptive grid construction failed for d={d:.2f}: {exc} ---")
+
+        print(f"--- Starting Zero Dirichlet SCF for d={d:.2f} ---")
+        try:
+            if state is None:
+                raise RuntimeError("adaptive grid state was not created")
             e_zero, _ = energy_and_forces(
                 state,
                 coords,
@@ -143,9 +187,12 @@ def main() -> int:
                 backend=backend_zero,
             )
             e_zero = float(e_zero)
-        except Exception:
+            print(f"--- Finished Zero Dirichlet SCF for d={d:.2f}; E={e_zero:.6f} ---")
+        except Exception as exc:
             e_zero = float("nan")
+            print(f"--- Zero Dirichlet SCF failed for d={d:.2f}: {exc} ---")
 
+        print(f"--- Starting Monopole Dirichlet SCF for d={d:.2f} ---")
         try:
             if state is None:
                 raise RuntimeError("adaptive grid state was not created")
@@ -160,10 +207,14 @@ def main() -> int:
                 backend=backend_mono,
             )
             e_mono = float(e_mono)
-        except Exception:
+            print(f"--- Finished Monopole Dirichlet SCF for d={d:.2f}; E={e_mono:.6f} ---")
+        except Exception as exc:
             e_mono = float("nan")
+            print(f"--- Monopole Dirichlet SCF failed for d={d:.2f}: {exc} ---")
 
+        print(f"--- Starting PySCF reference for d={d:.2f} ---")
         e_pyscf = run_pyscf(d, box_size=None)
+        print(f"--- Finished PySCF reference for d={d:.2f}; E={e_pyscf:.6f} ---")
 
         zero_energies.append(e_zero)
         mono_energies.append(e_mono)
