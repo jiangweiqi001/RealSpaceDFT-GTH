@@ -1,10 +1,18 @@
-"""Adaptive H2 dissociation verification against PySCF.
+"""Reduced adaptive H2 boundary-diagnostic script.
 
-This script mirrors the existing verify_h2.py flow, but replaces the uniform
-real-space path with the adaptive tensor-grid backend. The current adaptive
-Hartree path uses a monopole-Dirichlet box Poisson prototype, so this script is
-best interpreted as an adaptive-backend verification study rather than a final
-physical benchmark.
+This is a lightweight diagnostic study, not a final benchmark. The adaptive
+Hartree path currently offers two box-Poisson boundary choices:
+  - zero_dirichlet
+  - monopole_dirichlet
+The monopole variant is more isolated-like than zero Dirichlet, but still not
+an exact isolated/open-boundary Hartree treatment.
+
+The current adaptive SCF path still uses the conservative Python ``while`` loop
+inside the solver. That is not because the grid changes during SCF for a fixed
+geometry: at fixed geometry the adaptive grid is static. In principle, a single
+fixed-geometry adaptive SCF could be wrapped in ``jax.lax.while_loop`` once the
+remaining adaptive sparse/Hartree path is fully stabilized under JAX tracing.
+That migration is intentionally out of scope for this script.
 """
 
 from __future__ import annotations
@@ -64,23 +72,24 @@ def run_pyscf(dist, box_size=None):
 
 
 def main() -> int:
-    print(f"\n{'=' * 20} Adaptive H2 Verification {'=' * 20}")
+    print(f"\n{'=' * 20} Adaptive H2 Boundary Diagnostic {'=' * 20}")
 
     box_size = [18.0, 18.0, 18.0]
-    h_min = 0.10
-    h_max = 0.60
+    h_min = 0.25
+    h_max = 0.80
     r_core = 1.00
-    stretch_beta = 10.0
-    max_iter = 500
+    stretch_beta = 5.0
+    max_iter = 120
     mix_alpha = 0.30
-    tolerance = 1.0e-5
-    distances = [0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2]
+    tolerance = 5.0e-4
+    distances = [0.8, 1.4, 2.0, 2.8]
 
     pseudo_dir = os.path.join(project_root, "JaxDFT", "data", "gth_potentials")
     pseudos = load_pseudopotentials(["H"], pseudo_dir)
     pseudos_for_calc = [pseudos[0], pseudos[0]]
 
-    backend = AdaptiveBackend(hartree_boundary_mode="monopole_dirichlet")
+    backend_zero = AdaptiveBackend(hartree_boundary_mode="zero_dirichlet")
+    backend_mono = AdaptiveBackend(hartree_boundary_mode="monopole_dirichlet")
     key = jax.random.PRNGKey(42)
 
     print(
@@ -88,23 +97,33 @@ def main() -> int:
         f"box={box_size}, h_min={h_min}, h_max={h_max}, "
         f"r_core={r_core}, stretch_beta={stretch_beta}"
     )
-    print("Note: adaptive Hartree currently uses the monopole-Dirichlet box Poisson path.")
+    print("Note: this is not a final benchmark.")
+    print("Note: adaptive monopole-Dirichlet is still not an exact isolated/open-boundary Hartree treatment.")
+    print("Note: the goal here is to diagnose boundary sensitivity, not to force exact agreement with uniform or PySCF.")
+    print("Note: SCF settings are intentionally relaxed for speed in this reduced diagnostic script.")
+    print("Note: for fixed geometry the adaptive grid is static across SCF iterations; the current Python while-loop path is a conservative solver choice, not a geometry-change requirement.")
 
-    jax_energies = []
+    zero_energies = []
+    mono_energies = []
     pyscf_energies = []
 
-    print("-" * 75)
-    print(f"{'Dist':<6} | {'JaxDFT (Adaptive)':<20} | {'PySCF (TZVP)':<15} | {'Diff'}")
-    print("-" * 75)
+    print("-" * 120)
+    print(
+        f"{'Dist':<6} | {'PySCF':<14} | {'Adaptive Zero':<14} | {'Err Zero':<12} | "
+        f"{'Adaptive Mono':<14} | {'Err Mono':<12} | {'Delta(M-Z)':<12}"
+    )
+    print("-" * 120)
 
-    for d in distances:
+    for idx, d in enumerate(distances):
         coords = jnp.array([
             [0.0, 0.0, -d / 2.0],
             [0.0, 0.0, d / 2.0],
         ], dtype=jnp.float32)
+        dist_key = jax.random.fold_in(key, idx)
+        state = None
 
         try:
-            state = backend.create_grid(
+            state = backend_zero.create_grid(
                 spacing=h_min,
                 box_size=box_size,
                 atom_coords=coords,
@@ -113,40 +132,64 @@ def main() -> int:
                 r_core=r_core,
                 stretch_beta=stretch_beta,
             )
-            e_jax, _ = energy_and_forces(
+            e_zero, _ = energy_and_forces(
                 state,
                 coords,
                 pseudos_for_calc,
                 max_iter,
                 mix_alpha,
                 tolerance,
-                key,
-                backend=backend,
+                dist_key,
+                backend=backend_zero,
             )
-            e_jax = float(e_jax)
+            e_zero = float(e_zero)
         except Exception:
-            e_jax = float("nan")
+            e_zero = float("nan")
+
+        try:
+            if state is None:
+                raise RuntimeError("adaptive grid state was not created")
+            e_mono, _ = energy_and_forces(
+                state,
+                coords,
+                pseudos_for_calc,
+                max_iter,
+                mix_alpha,
+                tolerance,
+                dist_key,
+                backend=backend_mono,
+            )
+            e_mono = float(e_mono)
+        except Exception:
+            e_mono = float("nan")
 
         e_pyscf = run_pyscf(d, box_size=None)
 
-        jax_energies.append(e_jax)
+        zero_energies.append(e_zero)
+        mono_energies.append(e_mono)
         pyscf_energies.append(e_pyscf)
 
-        diff = e_jax - e_pyscf
-        print(f"{d:<6.2f} | {e_jax:<20.6f} | {e_pyscf:<15.6f} | {diff:.4f}")
+        err_zero = e_zero - e_pyscf
+        err_mono = e_mono - e_pyscf
+        delta_mz = e_mono - e_zero
+        print(
+            f"{d:<6.2f} | {e_pyscf:<14.6f} | {e_zero:<14.6f} | {err_zero:<12.4f} | "
+            f"{e_mono:<14.6f} | {err_mono:<12.4f} | {delta_mz:<12.4f}"
+        )
 
     plt.figure(figsize=(10, 6))
-    plt.plot(distances, jax_energies, "o-", label="JaxDFT (Adaptive, h_min=0.1)", linewidth=2)
-    plt.plot(distances, pyscf_energies, "x--", label="PySCF (TZVP Reference)", linewidth=2)
+    plt.plot(distances, zero_energies, "s--", label="JaxDFT (Adaptive, zero Dirichlet)", linewidth=2)
+    plt.plot(distances, mono_energies, "o-", label="JaxDFT (Adaptive, monopole Dirichlet)", linewidth=2)
+    plt.plot(distances, pyscf_energies, "x:", label="PySCF (TZVP Reference)", linewidth=2)
     plt.xlabel("Bond Length (Bohr)")
     plt.ylabel("Total Energy (Hartree)")
-    plt.title("H2 Dissociation: Adaptive JaxDFT vs PySCF")
+    plt.title("H2 Boundary Diagnostic: Adaptive Hartree Modes vs PySCF")
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.savefig("h2_adaptive_verification.png", dpi=150)
 
-    print("-" * 75)
-    print("Verification complete. Figure: h2_adaptive_verification.png")
+    print("-" * 120)
+    print("Saved figure: h2_adaptive_verification.png")
     return 0
 
 
