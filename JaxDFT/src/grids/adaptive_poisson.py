@@ -246,6 +246,50 @@ def compute_total_charge(grid, rho: Array) -> jnp.ndarray:
     return jnp.sum(rho_arr * volume_weights)
 
 
+def _compute_box_center(grid) -> jnp.ndarray:
+    return jnp.asarray(
+        [
+            0.5 * (grid.x[0] + grid.x[-1]),
+            0.5 * (grid.y[0] + grid.y[-1]),
+            0.5 * (grid.z[0] + grid.z[-1]),
+        ],
+        dtype=jnp.float32,
+    )
+
+
+def compute_charge_center(
+    grid,
+    rho: Array,
+    *,
+    total_charge: Array | None = None,
+    charge_tol: float = 1.0e-8,
+) -> jnp.ndarray:
+    """Compute the weighted density center r_c = (integral r rho dV) / Q.
+
+    If |Q| is too small, this safely falls back to the box center.
+    """
+    if charge_tol <= 0.0:
+        raise ValueError("charge_tol must be positive")
+
+    rho_arr = jnp.asarray(rho)
+    coords = jnp.asarray(grid.coords)
+    volume_weights = jnp.asarray(grid.volume_weights)
+    expected_shape = tuple(int(n) for n in grid.shape)
+    if rho_arr.shape != expected_shape:
+        raise ValueError(f"rho shape {rho_arr.shape} does not match grid shape {expected_shape}")
+    if coords.shape != expected_shape + (3,):
+        raise ValueError(f"grid.coords shape {coords.shape} does not match expected shape {expected_shape + (3,)}")
+
+    Q = compute_total_charge(grid, rho_arr) if total_charge is None else jnp.asarray(total_charge, dtype=volume_weights.dtype)
+    charge_tol_arr = jnp.asarray(charge_tol, dtype=volume_weights.dtype)
+    box_center = _compute_box_center(grid).astype(coords.dtype)
+    weighted_position = jnp.sum(coords * rho_arr[..., None] * volume_weights[..., None], axis=(0, 1, 2))
+    safe_Q = jnp.where(jnp.abs(Q) <= charge_tol_arr, jnp.ones_like(Q), Q)
+    raw_center = weighted_position / safe_Q
+    use_fallback = jnp.abs(Q) <= charge_tol_arr
+    return jnp.where(use_fallback, box_center, raw_center)
+
+
 def compute_dipole_moment(grid, rho: Array, r0: Array) -> jnp.ndarray:
     """Compute the dipole moment p_i = integral rho (x_i - r0_i) dV."""
     rho_arr = jnp.asarray(rho)
@@ -286,24 +330,44 @@ def compute_quadrupole_tensor(grid, rho: Array, r0: Array) -> jnp.ndarray:
     )
 
 
-def get_boundary_reference_center(grid, rho: Array | None = None, center_mode: str = "box_center") -> jnp.ndarray:
+def get_boundary_reference_center(
+    grid,
+    rho: Array | None = None,
+    center_mode: str = "box_center",
+    *,
+    charge_tol: float = 1.0e-8,
+    return_effective_mode: bool = False,
+) -> jnp.ndarray | tuple[jnp.ndarray, str]:
     """Return the reference center used for asymptotic boundary data.
 
-    The first implementation deliberately keeps the reference center conservative:
-    only the box center is supported.
+    Supported modes:
+      - ``box_center``
+      - ``charge_center`` using weighted density
+
+    If ``charge_center`` is requested but |Q| is too small, the center safely
+    falls back to the box center.
     """
-    if center_mode != "box_center":
+    if charge_tol <= 0.0:
+        raise ValueError("charge_tol must be positive")
+
+    box_center = _compute_box_center(grid)
+    if center_mode == "box_center":
+        center = box_center
+        effective_mode = "box_center"
+    elif center_mode == "charge_center":
+        if rho is None:
+            raise ValueError("rho is required when center_mode='charge_center'")
+        total_charge = compute_total_charge(grid, rho)
+        center = compute_charge_center(grid, rho, total_charge=total_charge, charge_tol=charge_tol)
+        effective_mode = "box_center" if float(jnp.abs(total_charge)) <= charge_tol else "charge_center"
+    else:
         raise ValueError(
-            f"unsupported center_mode {center_mode!r}; only 'box_center' is supported"
+            f"unsupported center_mode {center_mode!r}; expected one of ['box_center', 'charge_center']"
         )
-    return jnp.asarray(
-        [
-            0.5 * (grid.x[0] + grid.x[-1]),
-            0.5 * (grid.y[0] + grid.y[-1]),
-            0.5 * (grid.z[0] + grid.z[-1]),
-        ],
-        dtype=jnp.float32,
-    )
+
+    if return_effective_mode:
+        return center, effective_mode
+    return center
 
 
 def build_multipole_dirichlet_faces(
@@ -393,20 +457,35 @@ def build_monopole_dirichlet_faces(
     r0: Array | None = None,
     center_mode: str = "box_center",
     min_radius: float = 1.0e-8,
+    charge_tol: float = 1.0e-8,
 ) -> tuple[dict[str, jnp.ndarray], dict[str, Array | str]]:
-    """Backward-compatible monopole face builder retained for regression."""
+    """Backward-compatible monopole face builder retained for regression.
+
+    Supported center choices:
+      - ``box_center``
+      - ``charge_center`` using weighted density
+    """
     if min_radius <= 0.0:
         raise ValueError("min_radius must be positive")
+    if charge_tol <= 0.0:
+        raise ValueError("charge_tol must be positive")
 
     Q = compute_total_charge(grid, rho)
     if r0 is None:
-        r0_arr = get_boundary_reference_center(grid, rho=rho, center_mode=center_mode)
+        r0_arr, effective_center_mode = get_boundary_reference_center(
+            grid,
+            rho=rho,
+            center_mode=center_mode,
+            charge_tol=charge_tol,
+            return_effective_mode=True,
+        )
     else:
         r0_arr = jnp.asarray(r0, dtype=jnp.float32).reshape(-1)
         if r0_arr.size != 3:
             raise ValueError("r0 must contain exactly three coordinates")
         if not bool(jnp.all(jnp.isfinite(r0_arr))):
             raise ValueError("r0 must contain only finite values")
+        effective_center_mode = "explicit_r0"
 
     x = jnp.asarray(grid.x)
     y = jnp.asarray(grid.y)
@@ -415,6 +494,7 @@ def build_monopole_dirichlet_faces(
     y_int = y[1:-1]
     z_int = z[1:-1]
     min_radius_arr = jnp.asarray(min_radius, dtype=x.dtype)
+    charge_tol_arr = jnp.asarray(charge_tol, dtype=x.dtype)
 
     def monopole_values(x_face, y_face, z_face):
         radius = jnp.sqrt((x_face - r0_arr[0]) ** 2 + (y_face - r0_arr[1]) ** 2 + (z_face - r0_arr[2]) ** 2)
@@ -435,9 +515,11 @@ def build_monopole_dirichlet_faces(
     diagnostics = {
         "boundary_model": "monopole_dirichlet",
         "center_mode": center_mode,
+        "effective_center_mode": effective_center_mode,
         "total_charge": Q,
         "reference_center": r0_arr,
         "min_radius": min_radius_arr,
+        "charge_tolerance": charge_tol_arr,
     }
     return faces, diagnostics
 
@@ -564,6 +646,7 @@ __all__ = [
     "assemble_poisson_operator_3d",
     "build_dirichlet_boundary_load_3d",
     "compute_total_charge",
+    "compute_charge_center",
     "compute_dipole_moment",
     "compute_quadrupole_tensor",
     "get_boundary_reference_center",
