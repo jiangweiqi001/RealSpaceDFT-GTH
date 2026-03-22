@@ -56,9 +56,11 @@ class AdaptiveBackend:
         *,
         hartree_boundary_mode: str = "multipole_dirichlet",
         hartree_center_mode: str = "box_center",
+        kinetic_mode: str = "prototype_fd2",
     ):
         supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet", "uniform_exterior"}
         supported_center_modes = {"box_center", "charge_center"}
+        supported_kinetic_modes = {"prototype_fd2", "symmetric_fv"}
         if hartree_boundary_mode not in supported:
             raise ValueError(
                 f"unsupported hartree_boundary_mode {hartree_boundary_mode!r}; "
@@ -69,8 +71,14 @@ class AdaptiveBackend:
                 f"unsupported hartree_center_mode {hartree_center_mode!r}; "
                 f"expected one of {sorted(supported_center_modes)}"
             )
+        if kinetic_mode not in supported_kinetic_modes:
+            raise ValueError(
+                f"unsupported kinetic_mode {kinetic_mode!r}; "
+                f"expected one of {sorted(supported_kinetic_modes)}"
+            )
         self.hartree_boundary_mode = hartree_boundary_mode
         self.hartree_center_mode = hartree_center_mode
+        self.kinetic_mode = kinetic_mode
 
     def create_grid(self, spacing: float, box_size: ArrayLike, **kwargs) -> BackendState:
         """Create an adaptive tensor grid using spacing as the minimum spacing."""
@@ -148,8 +156,12 @@ class AdaptiveBackend:
         return build_local_potential_pointwise(atom_coords, state.coords, zion, rloc, c)
 
     def apply_kinetic(self, state: BackendState, psi: ArrayLike) -> ArrayLike:
-        """Apply the prototype adaptive kinetic operator -0.5 * Laplacian."""
-        return -0.5 * state.laplacian(psi)
+        """Apply the selected adaptive kinetic operator -0.5 * Laplacian."""
+        if self.kinetic_mode == "prototype_fd2":
+            return -0.5 * state.laplacian(psi)
+        if self.kinetic_mode == "symmetric_fv":
+            return -0.5 * state.laplacian_symmetric(psi)
+        raise ValueError(f"unsupported kinetic_mode {self.kinetic_mode!r}")
 
     def solve_hartree(self, state: BackendState, rho: ArrayLike) -> ArrayLike:
         """Solve Hartree with the current adaptive box-Poisson prototype.

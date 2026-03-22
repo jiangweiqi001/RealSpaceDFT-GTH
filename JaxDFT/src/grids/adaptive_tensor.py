@@ -39,6 +39,10 @@ class AdaptiveTensorGrid:
         """Apply the prototype adaptive tensor-product Laplacian."""
         return laplacian_nonuniform_3d(self, field)
 
+    def laplacian_symmetric(self, field: Array) -> Array:
+        """Apply the symmetric finite-volume-style adaptive Laplacian."""
+        return laplacian_nonuniform_symmetric_3d(self, field)
+
 
 def make_reference_axis(
     box_length: float,
@@ -174,6 +178,59 @@ def _quadratic_second_derivative_from_triplet(axis_triplet: Array, values_triple
     return c0 * values_triplet[0] + c1 * values_triplet[1] + c2 * values_triplet[2]
 
 
+def _zero_boundary_values(values: Array) -> Array:
+    """Return values with Dirichlet boundary nodes forced to zero."""
+    values = jnp.asarray(values)
+    zeros0 = jnp.zeros_like(values[0])
+    zeros1 = jnp.zeros_like(values[-1])
+    values = values.at[0].set(zeros0)
+    values = values.at[-1].set(zeros1)
+    return values
+
+
+def second_derivative_nonuniform_symmetric_1d(axis: Array, weights: Array, values: Array) -> Array:
+    """Apply a symmetric finite-volume-style second derivative on a nonuniform axis.
+
+    This operator uses the lumped nodal masses encoded by ``weights`` and the
+    edge fluxes across adjacent nodes, i.e. a 1D ``M^{-1}K``-style discretization.
+    It enforces strict Dirichlet values at the two boundary nodes by zeroing the
+    input boundary values and returning zero on the boundary rows.
+    """
+    axis = jnp.asarray(axis, dtype=jnp.float32).reshape(-1)
+    weights = jnp.asarray(weights, dtype=jnp.float32).reshape(-1)
+    values = jnp.asarray(values)
+
+    if axis.size < 3:
+        raise ValueError('axis must contain at least three nodes for a second derivative')
+    if values.shape[0] != axis.size:
+        raise ValueError(f'values.shape[0]={values.shape[0]} does not match axis size {axis.size}')
+    if weights.shape[0] != axis.size:
+        raise ValueError(f'weights.shape[0]={weights.shape[0]} does not match axis size {axis.size}')
+
+    diffs = axis[1:] - axis[:-1]
+    if bool(jnp.any(diffs <= 0.0)):
+        raise ValueError('axis must be strictly increasing')
+    if bool(jnp.any(weights <= 0.0)):
+        raise ValueError('weights must be positive')
+
+    values = _zero_boundary_values(values)
+    out = jnp.zeros_like(values)
+
+    hm = axis[1:-1] - axis[:-2]
+    hp = axis[2:] - axis[1:-1]
+    wi = weights[1:-1]
+    reshape = (-1,) + (1,) * (values.ndim - 1)
+    hm = hm.reshape(reshape)
+    hp = hp.reshape(reshape)
+    wi = wi.reshape(reshape)
+
+    flux_right = (values[2:] - values[1:-1]) / hp
+    flux_left = (values[1:-1] - values[:-2]) / hm
+    interior = (flux_right - flux_left) / wi
+    out = out.at[1:-1].set(interior)
+    return out
+
+
 def second_derivative_nonuniform_1d(axis: Array, values: Array) -> Array:
     """Apply a variable-spacing three-point second-derivative stencil.
 
@@ -223,6 +280,19 @@ def second_derivative_along_axis(field: Array, axis_coords: Array, axis: int) ->
     return jnp.moveaxis(d2, 0, axis)
 
 
+def second_derivative_along_axis_symmetric(
+    field: Array,
+    axis_coords: Array,
+    axis_weights: Array,
+    axis: int,
+) -> Array:
+    """Apply the symmetric finite-volume-style second derivative along one axis."""
+    field = jnp.asarray(field)
+    moved = jnp.moveaxis(field, axis, 0)
+    d2 = second_derivative_nonuniform_symmetric_1d(axis_coords, axis_weights, moved)
+    return jnp.moveaxis(d2, 0, axis)
+
+
 def laplacian_nonuniform_3d(grid: AdaptiveTensorGrid, field: Array) -> Array:
     """Apply the prototype tensor-product Laplacian on an adaptive grid."""
     field = jnp.asarray(field)
@@ -233,6 +303,31 @@ def laplacian_nonuniform_3d(grid: AdaptiveTensorGrid, field: Array) -> Array:
         second_derivative_along_axis(field, grid.x, axis=0)
         + second_derivative_along_axis(field, grid.y, axis=1)
         + second_derivative_along_axis(field, grid.z, axis=2)
+    )
+    if getattr(grid, 'mask', None) is not None:
+        lap = lap * grid.mask
+    return lap
+
+
+def laplacian_nonuniform_symmetric_3d(grid: AdaptiveTensorGrid, field: Array) -> Array:
+    """Apply a symmetric finite-volume-style tensor-product Laplacian.
+
+    The operator uses the existing nodal trapezoidal weights as a lumped mass
+    matrix and edge fluxes along each tensor-product axis. This yields a
+    numerically more symmetric ``M^{-1}K``-style discretization under the
+    adaptive weighted inner product while preserving the current full-grid API.
+    """
+    field = jnp.asarray(field)
+    if field.shape != grid.shape:
+        raise ValueError(f"field shape {field.shape} does not match grid shape {grid.shape}")
+
+    if getattr(grid, 'mask', None) is not None:
+        field = field * grid.mask
+
+    lap = (
+        second_derivative_along_axis_symmetric(field, grid.x, grid.wx, axis=0)
+        + second_derivative_along_axis_symmetric(field, grid.y, grid.wy, axis=1)
+        + second_derivative_along_axis_symmetric(field, grid.z, grid.wz, axis=2)
     )
     if getattr(grid, 'mask', None) is not None:
         lap = lap * grid.mask
@@ -433,6 +528,9 @@ __all__ = [
     "compute_axis_weights",
     "build_volume_weights",
     "second_derivative_nonuniform_1d",
+    "second_derivative_nonuniform_symmetric_1d",
     "second_derivative_along_axis",
+    "second_derivative_along_axis_symmetric",
     "laplacian_nonuniform_3d",
+    "laplacian_nonuniform_symmetric_3d",
 ]
