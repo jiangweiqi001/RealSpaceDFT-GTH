@@ -7,6 +7,7 @@ the Kohn-Sham eigenproblem, and mixes the density until convergence.
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from .backends.uniform import (
     UniformBackend,
     precompute_uniform_poisson_kernel,
@@ -32,6 +33,56 @@ def _dirichlet_project_block(grid, block):
     block = jnp.asarray(block)
     mask_flat = jnp.asarray(mask, dtype=block.dtype).reshape((-1, 1))
     return block * mask_flat
+
+
+def _maybe_trace_append(trace_sink, payload):
+    """Append a payload to a trace sink when tracing is enabled."""
+    if trace_sink is not None:
+        trace_sink.append(payload)
+
+
+def _trace_array(arr):
+    """Convert a JAX array to a compact NumPy array for Python-side traces."""
+    return np.asarray(jnp.asarray(arr), dtype=np.float32)
+
+
+def _rms_norm(arr):
+    """Return the RMS norm of an array-like object as a Python float."""
+    arr = jnp.asarray(arr, dtype=jnp.float32)
+    return float(jnp.sqrt(jnp.mean(arr * arr)))
+
+
+def _state0_overlap_prev(grid, backend, prev_block, curr_block):
+    """Return the overlap between the previous and current leading state."""
+    if prev_block is None or curr_block is None:
+        return None
+    if prev_block.shape[1] == 0 or curr_block.shape[1] == 0:
+        return None
+    prev0 = prev_block[:, 0].reshape(grid.shape)
+    curr0 = curr_block[:, 0].reshape(grid.shape)
+    prev_norm = float(backend.inner_product(grid, prev0, prev0))
+    curr_norm = float(backend.inner_product(grid, curr0, curr0))
+    if prev_norm <= 0.0 or curr_norm <= 0.0:
+        return None
+    return float(jnp.abs(backend.inner_product(grid, prev0, curr0)))
+
+
+def _occupied_subspace_overlap_prev(grid, backend, prev_block, curr_block, max_m=2):
+    """Return a small occupied-subspace continuity metric across iterations."""
+    if prev_block is None or curr_block is None:
+        return None
+    m = min(int(prev_block.shape[1]), int(curr_block.shape[1]), int(max_m))
+    if m <= 0:
+        return None
+    prev_fields = jnp.moveaxis(prev_block[:, :m].reshape(grid.shape + (m,)), -1, 0)
+    curr_fields = jnp.moveaxis(curr_block[:, :m].reshape(grid.shape + (m,)), -1, 0)
+    gram = np.zeros((m, m), dtype=np.float64)
+    for i in range(m):
+        for j in range(m):
+            gram[i, j] = float(backend.inner_product(grid, curr_fields[i], prev_fields[j]))
+    sigma = np.linalg.svd(gram, compute_uv=False)
+    sigma = np.clip(sigma, 0.0, 1.0)
+    return float(np.min(sigma))
 
 
 def _metric_scale(grid, backend):
@@ -102,6 +153,8 @@ def solve_orbitals_subspace(
     key=None,
     grid=None,
     backend=None,
+    trace_sink=None,
+    trace_context=None,
 ):
     """
     Iterative eigensolver using block subspace expansion + Rayleigh-Ritz.
@@ -124,6 +177,9 @@ def solve_orbitals_subspace(
         )
 
     metric_enabled = grid is not None and backend is not None
+    trace_enabled = trace_sink is not None
+    if trace_context is None:
+        trace_context = {}
 
     if x_init is None:
         X = jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
@@ -209,6 +265,8 @@ def solve_orbitals_subspace(
     i = 0
 
     while i < max_iter and float(res_norm) > tol:
+        current_dim = int(X.shape[1])
+
         # 1) Rayleigh-Ritz in current metric-orthonormal subspace
         H_sub = _metric_symmetrize(_metric_gram(grid, backend, X, HX, scale))
         E, V_sub = jnp.linalg.eigh(H_sub)
@@ -223,6 +281,18 @@ def solve_orbitals_subspace(
         R = _dirichlet_project_block(grid, R)
         res_vec = _metric_block_norms(grid, backend, R, scale)
         res_norm = jnp.max(res_vec)
+        _maybe_trace_append(
+            trace_sink,
+            {
+                "scf_iter": trace_context.get("scf_iter"),
+                "sub_iter": int(i),
+                "stage": "rayleigh_ritz",
+                "subspace_dim": current_dim,
+                "expanded_subspace_dim": current_dim * 2,
+                "ritz_eigvals": _trace_array(E[: min(4, E.shape[0])]),
+                "max_residual_norm": float(res_norm),
+            },
+        )
         if float(res_norm) <= tol:
             i += 1
             break
@@ -256,6 +326,18 @@ def solve_orbitals_subspace(
         R_new = _dirichlet_project_block(grid, R_new)
         res_vec_new = _metric_block_norms(grid, backend, R_new, scale)
         res_norm = jnp.max(res_vec_new)
+        _maybe_trace_append(
+            trace_sink,
+            {
+                "scf_iter": trace_context.get("scf_iter"),
+                "sub_iter": int(i),
+                "stage": "expanded_update",
+                "subspace_dim": int(Z.shape[1]),
+                "expanded_subspace_dim": int(Z.shape[1]),
+                "ritz_eigvals": _trace_array(E[: min(4, E.shape[0])]),
+                "max_residual_norm": float(res_norm),
+            },
+        )
         i += 1
 
     return E, X
@@ -345,7 +427,7 @@ def anderson_mixing(rho, rho_new, f_hist, mix_alpha, iter_idx, m=5):
     return jax.lax.cond(iter_idx == 0, first, later, operand=None)
 
 
-def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key, backend=None):
+def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key, backend=None, trace_sink=None, trace_mode="off"):
     """Run the self-consistent field (SCF) loop.
 
     Args:
@@ -368,6 +450,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     coords = jnp.asarray(coords, dtype=jnp.float32)
     if key is None:
         key = jax.random.PRNGKey(42)
+    trace_enabled = trace_sink is not None and trace_mode != "off" and getattr(backend, "name", None) != "uniform"
     
     # 初始密度
     rho = jnp.zeros(grid.shape, dtype=jnp.float32)
@@ -420,6 +503,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         metric_grid = grid if metric_backend is not None else None
         orbital_max_iter = 30 if metric_backend is None else 8
         orbital_tol = 1e-5 if metric_backend is None else 1e-4
+        orbital_trace = [] if trace_enabled else None
         eigvals, eigvecs = solve_orbitals_subspace(
             apply_h,
             n_grid,
@@ -430,6 +514,8 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             key=iter_key,
             grid=metric_grid,
             backend=metric_backend,
+            trace_sink=orbital_trace,
+            trace_context={"scf_iter": int(i)} if trace_enabled else None,
         )
         
         # 归一化
@@ -447,6 +533,26 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             rho_cur.reshape(-1), rho_new.reshape(-1), f_hist_cur, mix_alpha, i
         )
         rho_mixed = _dirichlet_project_field(grid, rho_flat.reshape(grid.shape))
+        if trace_enabled:
+            _maybe_trace_append(
+                trace_sink,
+                {
+                    "scf_iter": int(i),
+                    "x_init": _trace_array(eigvecs0),
+                    "x_init_norm": float(jnp.linalg.norm(eigvecs0)),
+                    "eigvals": _trace_array(eigvals[: min(4, eigvals.shape[0])]),
+                    "eigvecs": _trace_array(eigvecs),
+                    "state0_overlap_prev": _state0_overlap_prev(grid, backend, eigvecs0, eigvecs),
+                    "occupied_subspace_overlap_prev": _occupied_subspace_overlap_prev(grid, backend, eigvecs0, eigvecs, max_m=2),
+                    "rho_in": _trace_array(rho_cur),
+                    "rho_new": _trace_array(rho_new),
+                    "rho_mixed": _trace_array(rho_mixed),
+                    "rho_update_norm": _rms_norm(rho_new - rho_cur),
+                    "rho_mix_step_norm": _rms_norm(rho_mixed - rho_cur),
+                    "rho_new_mixed_diff_norm": _rms_norm(rho_mixed - rho_new),
+                    "orbital_trace": orbital_trace,
+                },
+            )
         return i + 1, rho_mixed, f_hist_cur, diff, eigvals, eigvecs, V_H, eps_xc, v_xc
 
     state0 = (i0, rho, f_hist, diff0, eigvals0, eigvecs0, V_H0, eps_xc0, v_xc0)
