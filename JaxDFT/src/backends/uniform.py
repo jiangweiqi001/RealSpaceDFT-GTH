@@ -80,7 +80,7 @@ class UniformBackend:
         """Apply the current uniform-grid kinetic operator."""
         return -0.5 * laplacian_8th(psi, state.spacing, state.mask)
 
-    def solve_hartree(self, state: BackendState, rho: ArrayLike) -> ArrayLike:
+    def solve_hartree(self, state: BackendState, rho: ArrayLike, v_init: ArrayLike | None = None) -> ArrayLike:
         """Solve Hartree using the current uniform-grid FFT Poisson path."""
         key = (tuple(int(n) for n in state.shape), float(state.spacing))
         kernel_k = self._hartree_kernel_cache.get(key)

@@ -9,10 +9,19 @@ from __future__ import annotations
 
 from typing import Any
 
+import jax
 import jax.numpy as jnp
 
 
 Array = jnp.ndarray
+
+
+def _contains_tracer(obj: Any) -> bool:
+    """Return True when any leaf of obj is a JAX tracer."""
+    for leaf in jax.tree_util.tree_leaves(obj):
+        if isinstance(leaf, jax.core.Tracer):
+            return True
+    return False
 
 
 class AdaptiveTensorGrid:
@@ -148,7 +157,7 @@ def compute_axis_weights(axis: Array) -> Array:
         raise ValueError("axis must contain at least two nodes")
 
     diffs = axis[1:] - axis[:-1]
-    if bool(jnp.any(diffs <= 0.0)):
+    if not _contains_tracer(diffs) and bool(jnp.any(diffs <= 0.0)):
         raise ValueError("axis must be strictly increasing")
 
     weights = jnp.zeros_like(axis)
@@ -208,9 +217,9 @@ def second_derivative_nonuniform_symmetric_1d(axis: Array, weights: Array, value
         raise ValueError(f'weights.shape[0]={weights.shape[0]} does not match axis size {axis.size}')
 
     diffs = axis[1:] - axis[:-1]
-    if bool(jnp.any(diffs <= 0.0)):
+    if not _contains_tracer(diffs) and bool(jnp.any(diffs <= 0.0)):
         raise ValueError('axis must be strictly increasing')
-    if bool(jnp.any(weights <= 0.0)):
+    if not _contains_tracer(weights) and bool(jnp.any(weights <= 0.0)):
         raise ValueError('weights must be positive')
 
     values = _zero_boundary_values(values)
@@ -250,7 +259,7 @@ def second_derivative_nonuniform_1d(axis: Array, values: Array) -> Array:
         raise ValueError(f"values.shape[0]={values.shape[0]} does not match axis size {axis.size}")
 
     diffs = axis[1:] - axis[:-1]
-    if bool(jnp.any(diffs <= 0.0)):
+    if not _contains_tracer(diffs) and bool(jnp.any(diffs <= 0.0)):
         raise ValueError("axis must be strictly increasing")
 
     left = _quadratic_second_derivative_from_triplet(axis[:3], values[:3])

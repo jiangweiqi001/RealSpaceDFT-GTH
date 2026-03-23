@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 from jax.experimental import sparse as jsparse
 import jax.scipy.sparse.linalg as jax_cg
@@ -68,7 +69,7 @@ def _coerce_boundary_faces_3d(grid, boundary_faces: dict[str, Array] | None) -> 
             arr = jnp.asarray(boundary_faces[key], dtype=jnp.float32)
             if arr.shape != shape:
                 raise ValueError(f"{key} shape {arr.shape} does not match expected shape {shape}")
-            if not bool(jnp.all(jnp.isfinite(arr))):
+            if not _contains_tracer(arr) and not bool(jnp.all(jnp.isfinite(arr))):
                 raise ValueError(f"{key} must contain only finite values")
             faces[key] = arr
         else:
@@ -232,6 +233,39 @@ def build_dirichlet_boundary_load_3d(grid, boundary_faces: dict[str, Array]) -> 
     return jnp.reshape(load, (-1,))
 
 
+def _build_dirichlet_boundary_load_3d_numpy(grid, boundary_faces: dict[str, Array]) -> np.ndarray:
+    """NumPy companion to the Dirichlet face load assembly for direct sparse solves."""
+    x = np.asarray(grid.x, dtype=np.float64)
+    y = np.asarray(grid.y, dtype=np.float64)
+    z = np.asarray(grid.z, dtype=np.float64)
+    wx = np.asarray(grid.wx, dtype=np.float64)
+    wy = np.asarray(grid.wy, dtype=np.float64)
+    wz = np.asarray(grid.wz, dtype=np.float64)
+    faces = _coerce_boundary_faces_3d(grid, boundary_faces)
+    faces_np = {key: np.asarray(val, dtype=np.float64) for key, val in faces.items()}
+
+    wx_int = wx[1:-1]
+    wy_int = wy[1:-1]
+    wz_int = wz[1:-1]
+    load = np.zeros((x.size - 2, y.size - 2, z.size - 2), dtype=np.float64)
+
+    hx_lo = x[1] - x[0]
+    hx_hi = x[-1] - x[-2]
+    hy_lo = y[1] - y[0]
+    hy_hi = y[-1] - y[-2]
+    hz_lo = z[1] - z[0]
+    hz_hi = z[-1] - z[-2]
+
+    load[0, :, :] += (wy_int[:, None] * wz_int[None, :]) * (faces_np['x_lo'] / hx_lo)
+    load[-1, :, :] += (wy_int[:, None] * wz_int[None, :]) * (faces_np['x_hi'] / hx_hi)
+    load[:, 0, :] += (wx_int[:, None] * wz_int[None, :]) * (faces_np['y_lo'] / hy_lo)
+    load[:, -1, :] += (wx_int[:, None] * wz_int[None, :]) * (faces_np['y_hi'] / hy_hi)
+    load[:, :, 0] += (wx_int[:, None] * wy_int[None, :]) * (faces_np['z_lo'] / hz_lo)
+    load[:, :, -1] += (wx_int[:, None] * wy_int[None, :]) * (faces_np['z_hi'] / hz_hi)
+
+    return load.reshape(-1)
+
+
 def compute_total_charge(grid, rho: Array) -> jnp.ndarray:
     """Compute total charge Q = integral rho dV using adaptive volume weights."""
     rho_arr = jnp.asarray(rho)
@@ -359,7 +393,10 @@ def get_boundary_reference_center(
             raise ValueError("rho is required when center_mode='charge_center'")
         total_charge = compute_total_charge(grid, rho)
         center = compute_charge_center(grid, rho, total_charge=total_charge, charge_tol=charge_tol)
-        effective_mode = "box_center" if float(jnp.abs(total_charge)) <= charge_tol else "charge_center"
+        if _contains_tracer(total_charge):
+            effective_mode = "charge_center"
+        else:
+            effective_mode = "box_center" if float(jnp.abs(total_charge)) <= charge_tol else "charge_center"
     else:
         raise ValueError(
             f"unsupported center_mode {center_mode!r}; expected one of ['box_center', 'charge_center']"
@@ -394,7 +431,7 @@ def build_multipole_dirichlet_faces(
         r0_arr = jnp.asarray(r0, dtype=jnp.float32).reshape(-1)
         if r0_arr.size != 3:
             raise ValueError("r0 must contain exactly three coordinates")
-        if not bool(jnp.all(jnp.isfinite(r0_arr))):
+        if not _contains_tracer(r0_arr) and not bool(jnp.all(jnp.isfinite(r0_arr))):
             raise ValueError("r0 must contain only finite values")
 
     Q = compute_total_charge(grid, rho)
@@ -483,7 +520,7 @@ def build_monopole_dirichlet_faces(
         r0_arr = jnp.asarray(r0, dtype=jnp.float32).reshape(-1)
         if r0_arr.size != 3:
             raise ValueError("r0 must contain exactly three coordinates")
-        if not bool(jnp.all(jnp.isfinite(r0_arr))):
+        if not _contains_tracer(r0_arr) and not bool(jnp.all(jnp.isfinite(r0_arr))):
             raise ValueError("r0 must contain only finite values")
         effective_center_mode = "explicit_r0"
 
@@ -536,11 +573,13 @@ def _precompute_uniform_exterior_poisson_kernel(grid_shape: tuple[int, int, int]
     return jnp.fft.fftn(kernel)
 
 
-def _solve_uniform_exterior_poisson(rho: Array, spacing: float) -> jnp.ndarray:
+def _solve_uniform_exterior_poisson(rho: Array, spacing: float, kernel_k: Array | None = None) -> jnp.ndarray:
     """Solve the auxiliary uniform-grid free-space-like Hartree problem via zero-padded FFT."""
-    rho_arr = jnp.asarray(rho)
+    rho_arr = jnp.asarray(rho, dtype=jnp.float32)
     nx, ny, nz = (int(n) for n in rho_arr.shape)
-    kernel_k = _precompute_uniform_exterior_poisson_kernel((nx, ny, nz), float(spacing))
+    if kernel_k is None:
+        kernel_k = _precompute_uniform_exterior_poisson_kernel((nx, ny, nz), float(spacing))
+    kernel_k = jnp.asarray(kernel_k)
     rho_pad = jnp.pad(rho_arr, ((0, nx), (0, ny), (0, nz)), mode="constant")
     rho_k = jnp.fft.fftn(rho_pad)
     v_pad = jnp.fft.ifftn(rho_k * kernel_k).real * (spacing**3)
@@ -592,6 +631,70 @@ def _uniform_axis_cell_indices(points: np.ndarray, axis: np.ndarray) -> tuple[np
     base = origin + spacing * idx0
     frac = np.clip((points - base) / spacing, 0.0, 1.0)
     return idx0, frac
+
+
+def _build_trilinear_stencil_cache(
+    points: np.ndarray,
+    x: np.ndarray,
+    y: np.ndarray,
+    z: np.ndarray,
+    *,
+    value_scale: float = 1.0,
+) -> tuple[tuple[jnp.ndarray, ...], tuple[jnp.ndarray, ...]]:
+    """Precompute trilinear gather/scatter indices and weights for fixed probe points."""
+    ix, tx = _uniform_axis_cell_indices(points[:, 0], x)
+    iy, ty = _uniform_axis_cell_indices(points[:, 1], y)
+    iz, tz = _uniform_axis_cell_indices(points[:, 2], z)
+    shape = (int(x.size), int(y.size), int(z.size))
+    wx = (1.0 - tx, tx)
+    wy = (1.0 - ty, ty)
+    wz = (1.0 - tz, tz)
+    indices = []
+    weights = []
+    for ox, wx_part in enumerate(wx):
+        for oy, wy_part in enumerate(wy):
+            for oz, wz_part in enumerate(wz):
+                flat_idx = np.ravel_multi_index((ix + ox, iy + oy, iz + oz), shape)
+                flat_w = value_scale * wx_part * wy_part * wz_part
+                indices.append(jnp.asarray(flat_idx, dtype=jnp.int32))
+                weights.append(jnp.asarray(flat_w, dtype=jnp.float32))
+    return tuple(indices), tuple(weights)
+
+
+def _deposit_trilinear_to_uniform_cached(charges: jnp.ndarray, cache: dict[str, Any]) -> tuple[jnp.ndarray, dict[str, Array | tuple[int, int, int]]]:
+    """Deposit charges onto the cached auxiliary uniform grid using JAX scatter-adds."""
+    charges = jnp.asarray(charges, dtype=jnp.float32).reshape(-1)
+    rho_flat = jnp.zeros((int(cache['n_ext_flat']),), dtype=jnp.float32)
+    for idx, weight in zip(cache['deposit_indices'], cache['deposit_weights']):
+        rho_flat = rho_flat.at[idx].add(charges * weight)
+    rho = rho_flat.reshape(cache['shape_ext'])
+    charge_in = jnp.sum(charges)
+    charge_out = jnp.sum(rho) * cache['dv_ext']
+    rel_err = jnp.abs(charge_out - charge_in) / jnp.maximum(jnp.abs(charge_in), 1.0e-12)
+    diagnostics = {
+        'charge_in': charge_in,
+        'charge_deposited': charge_out,
+        'relative_charge_error': rel_err,
+        'shape_ext': cache['shape_ext'],
+    }
+    return rho, diagnostics
+
+
+def _interpolate_trilinear_from_uniform_cached(field: Array, indices: tuple[jnp.ndarray, ...], weights: tuple[jnp.ndarray, ...], out_shape: tuple[int, ...]) -> jnp.ndarray:
+    """Evaluate a cached trilinear interpolation stencil on a uniform field."""
+    flat = jnp.asarray(field).reshape(-1)
+    values = jnp.zeros(indices[0].shape, dtype=flat.dtype)
+    for idx, weight in zip(indices, weights):
+        values = values + flat[idx] * weight.astype(flat.dtype)
+    return values.reshape(out_shape)
+
+
+def _contains_tracer(obj: Any) -> bool:
+    """Return True when any leaf of obj is a JAX tracer."""
+    for leaf in jax.tree_util.tree_leaves(obj):
+        if isinstance(leaf, jax.core.Tracer):
+            return True
+    return False
 
 
 def _deposit_trilinear_to_uniform(points: np.ndarray, charges: np.ndarray, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple[np.ndarray, dict[str, float | tuple[int, int, int]]]:
@@ -646,6 +749,80 @@ def _interpolate_trilinear_from_uniform(field: np.ndarray, x: np.ndarray, y: np.
     return values
 
 
+def _get_uniform_exterior_cache(grid, *, padding: float = 8.0, dx_ext: float = 0.8) -> dict[str, Any]:
+    """Return cached auxiliary uniform-grid metadata for the adaptive exterior solve."""
+    cache_store = getattr(grid, 'uniform_exterior_cache', None)
+    if cache_store is None:
+        cache_store = {}
+        setattr(grid, 'uniform_exterior_cache', cache_store)
+
+    cache_key = (float(padding), float(dx_ext))
+    cache = cache_store.get(cache_key)
+    if cache is not None:
+        return cache
+
+    grid_host = type('_GridHostView', (), {})()
+    grid_host.x = getattr(grid, 'x_host', np.asarray(grid.x, dtype=np.float64))
+    grid_host.y = getattr(grid, 'y_host', np.asarray(grid.y, dtype=np.float64))
+    grid_host.z = getattr(grid, 'z_host', np.asarray(grid.z, dtype=np.float64))
+    x_ext, y_ext, z_ext, diagnostics = _build_uniform_exterior_axes(grid_host, padding=padding, dx_ext=dx_ext)
+    ext_shape = tuple(int(n) for n in diagnostics['shape_ext'])
+    dv_ext = float((x_ext[1] - x_ext[0]) * (y_ext[1] - y_ext[0]) * (z_ext[1] - z_ext[0]))
+    kernel_k = _precompute_uniform_exterior_poisson_kernel(ext_shape, float(dx_ext))
+
+    coords = np.asarray(getattr(grid, 'coords_host', grid.coords), dtype=np.float64).reshape(-1, 3)
+    deposit_indices, deposit_weights = _build_trilinear_stencil_cache(
+        coords,
+        x_ext,
+        y_ext,
+        z_ext,
+        value_scale=1.0 / dv_ext,
+    )
+
+    x = np.asarray(grid.x, dtype=np.float64)
+    y = np.asarray(grid.y, dtype=np.float64)
+    z = np.asarray(grid.z, dtype=np.float64)
+    x_int = x[1:-1]
+    y_int = y[1:-1]
+    z_int = z[1:-1]
+
+    y_grid_x, z_grid_x = np.meshgrid(y_int, z_int, indexing='ij')
+    x_grid_y, z_grid_y = np.meshgrid(x_int, z_int, indexing='ij')
+    x_grid_z, y_grid_z = np.meshgrid(x_int, y_int, indexing='ij')
+    face_arrays = {
+        'x_lo': (np.full_like(y_grid_x, x[0]), y_grid_x, z_grid_x),
+        'x_hi': (np.full_like(y_grid_x, x[-1]), y_grid_x, z_grid_x),
+        'y_lo': (x_grid_y, np.full_like(x_grid_y, y[0]), z_grid_y),
+        'y_hi': (x_grid_y, np.full_like(x_grid_y, y[-1]), z_grid_y),
+        'z_lo': (x_grid_z, y_grid_z, np.full_like(x_grid_z, z[0])),
+        'z_hi': (x_grid_z, y_grid_z, np.full_like(x_grid_z, z[-1])),
+    }
+    face_interp = {}
+    for key, arrs in face_arrays.items():
+        pts = np.stack([arrs[0].reshape(-1), arrs[1].reshape(-1), arrs[2].reshape(-1)], axis=-1)
+        interp_indices, interp_weights = _build_trilinear_stencil_cache(pts, x_ext, y_ext, z_ext, value_scale=1.0)
+        face_interp[key] = {
+            'indices': interp_indices,
+            'weights': interp_weights,
+            'shape': arrs[0].shape,
+        }
+
+    cache = {
+        'kernel_k': kernel_k,
+        'diagnostics': diagnostics,
+        'shape_ext': ext_shape,
+        'n_ext_flat': int(np.prod(ext_shape)),
+        'dv_ext': jnp.asarray(dv_ext, dtype=jnp.float32),
+        'deposit_indices': deposit_indices,
+        'deposit_weights': deposit_weights,
+        'face_interp': face_interp,
+        'padding': float(padding),
+        'dx_ext': float(dx_ext),
+    }
+    cache_store[cache_key] = cache
+    return cache
+
+
 def build_uniform_exterior_dirichlet_faces(
     grid,
     rho: Array,
@@ -666,37 +843,21 @@ def build_uniform_exterior_dirichlet_faces(
     if rho_arr.shape != expected_shape:
         raise ValueError(f"rho shape {rho_arr.shape} does not match grid shape {expected_shape}")
 
-    x_ext, y_ext, z_ext, ext_diag = _build_uniform_exterior_axes(grid, padding=padding, dx_ext=dx_ext)
-    coords = np.asarray(grid.coords, dtype=np.float64).reshape(-1, 3)
-    charges = np.asarray(jnp.asarray(grid.volume_weights) * rho_arr, dtype=np.float64).reshape(-1)
-    rho_ext, deposit_diag = _deposit_trilinear_to_uniform(coords, charges, x_ext, y_ext, z_ext)
-    v_ext = np.asarray(_solve_uniform_exterior_poisson(jnp.asarray(rho_ext, dtype=jnp.float32), float(dx_ext)), dtype=np.float64)
+    cache = _get_uniform_exterior_cache(grid, padding=padding, dx_ext=dx_ext)
+    ext_diag = cache['diagnostics']
+    charges = jnp.asarray(grid.volume_weights, dtype=jnp.float32).reshape(-1) * rho_arr.reshape(-1)
+    rho_ext, deposit_diag = _deposit_trilinear_to_uniform_cached(charges, cache)
+    v_ext = _solve_uniform_exterior_poisson(rho_ext, float(dx_ext), kernel_k=cache['kernel_k'])
 
-    x = np.asarray(grid.x, dtype=np.float64)
-    y = np.asarray(grid.y, dtype=np.float64)
-    z = np.asarray(grid.z, dtype=np.float64)
-    x_int = x[1:-1]
-    y_int = y[1:-1]
-    z_int = z[1:-1]
-
-    y_grid_x, z_grid_x = np.meshgrid(y_int, z_int, indexing="ij")
-    x_grid_y, z_grid_y = np.meshgrid(x_int, z_int, indexing="ij")
-    x_grid_z, y_grid_z = np.meshgrid(x_int, y_int, indexing="ij")
-
-    def face_values(x_face, y_face, z_face):
-        pts = np.stack([x_face.reshape(-1), y_face.reshape(-1), z_face.reshape(-1)], axis=-1)
-        vals = _interpolate_trilinear_from_uniform(v_ext, x_ext, y_ext, z_ext, pts)
-        return vals.reshape(x_face.shape)
-
-    faces_np = {
-        "x_lo": face_values(np.full_like(y_grid_x, x[0]), y_grid_x, z_grid_x),
-        "x_hi": face_values(np.full_like(y_grid_x, x[-1]), y_grid_x, z_grid_x),
-        "y_lo": face_values(x_grid_y, np.full_like(x_grid_y, y[0]), z_grid_y),
-        "y_hi": face_values(x_grid_y, np.full_like(x_grid_y, y[-1]), z_grid_y),
-        "z_lo": face_values(x_grid_z, y_grid_z, np.full_like(x_grid_z, z[0])),
-        "z_hi": face_values(x_grid_z, y_grid_z, np.full_like(x_grid_z, z[-1])),
+    faces = {
+        key: _interpolate_trilinear_from_uniform_cached(
+            v_ext,
+            cache['face_interp'][key]['indices'],
+            cache['face_interp'][key]['weights'],
+            cache['face_interp'][key]['shape'],
+        ).astype(jnp.float32)
+        for key in cache['face_interp']
     }
-    faces = {key: jnp.asarray(val, dtype=jnp.float32) for key, val in faces_np.items()}
 
     diagnostics = {
         "boundary_model": "uniform_exterior_dirichlet",
@@ -710,8 +871,8 @@ def build_uniform_exterior_dirichlet_faces(
         "charge_in": deposit_diag["charge_in"],
         "charge_deposited": deposit_diag["charge_deposited"],
         "relative_charge_error": deposit_diag["relative_charge_error"],
-        "ext_potential_min": jnp.asarray(float(np.min(v_ext)), dtype=jnp.float32),
-        "ext_potential_max": jnp.asarray(float(np.max(v_ext)), dtype=jnp.float32),
+        "ext_potential_min": jnp.min(v_ext).astype(jnp.float32),
+        "ext_potential_max": jnp.max(v_ext).astype(jnp.float32),
     }
     return faces, diagnostics
 
@@ -722,6 +883,7 @@ def solve_hartree_uniform_exterior_dirichlet_3d(
     *,
     padding: float = 8.0,
     dx_ext: float = 0.8,
+    v_init: Array | None = None,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve the prototype Hartree problem using an auxiliary uniform exterior boundary provider."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
@@ -731,7 +893,7 @@ def solve_hartree_uniform_exterior_dirichlet_3d(
         padding=padding,
         dx_ext=dx_ext,
     )
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces)
+    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces, u_init=v_init)
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     diagnostics.update(face_diagnostics)
@@ -742,6 +904,7 @@ def solve_poisson_dirichlet_3d(
     grid,
     rhs: Array,
     boundary_faces: dict[str, Array] | None = None,
+    u_init: Array | None = None,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve -Laplace(u) = rhs on an adaptive tensor grid with Dirichlet boundaries.
 
@@ -762,9 +925,45 @@ def solve_poisson_dirichlet_3d(
             "construct it through AdaptiveBackend.create_grid/create_adaptive_grid"
         )
 
+    A_lu = getattr(grid, "A_lu", None)
+    A_csr = getattr(grid, "A_csr", None)
+    M_csr = getattr(grid, "M_csr", None)
+    boundary_mode = "zero_dirichlet"
+    use_direct_solver = (
+        A_lu is not None
+        and A_csr is not None
+        and M_csr is not None
+        and not _contains_tracer(rhs_arr)
+        and not _contains_tracer(boundary_faces)
+    )
+
+    if use_direct_solver:
+        rhs_np = np.asarray(rhs_arr, dtype=np.float64)
+        b_np = M_csr @ rhs_np[1:-1, 1:-1, 1:-1].reshape(-1)
+        boundary_load_np = None
+        if boundary_faces is not None:
+            boundary_load_np = _build_dirichlet_boundary_load_3d_numpy(grid, boundary_faces)
+            b_np = b_np + boundary_load_np
+            boundary_mode = "inhomogeneous_dirichlet"
+        u_int_np = A_lu.solve(b_np)
+        residual_np = A_csr @ u_int_np - b_np
+        rhs_norm = float(np.linalg.norm(b_np))
+        residual_norm = float(np.linalg.norm(residual_np))
+        rel_res = residual_norm / max(rhs_norm, 1.0e-30)
+        diagnostics = {
+            "method": "scipy_splu",
+            "n_unknowns": int(u_int_np.size),
+            "nnz": int(getattr(grid, "A_nnz", A_csr.nnz)),
+            "residual_norm": jnp.asarray(residual_norm, dtype=jnp.float32),
+            "relative_residual": jnp.asarray(rel_res, dtype=jnp.float32),
+            "boundary_mode": boundary_mode,
+            "boundary_load_norm": jnp.asarray(0.0 if boundary_load_np is None else float(np.linalg.norm(boundary_load_np)), dtype=jnp.float32),
+            "cg_info": None,
+        }
+        return unflatten_interior_3d(grid, u_int_np, boundary_faces=boundary_faces), diagnostics
+
     b = M_bcoo @ flatten_interior_3d(rhs_arr)
     boundary_load = None
-    boundary_mode = "zero_dirichlet"
     if boundary_faces is not None:
         boundary_load = build_dirichlet_boundary_load_3d(grid, boundary_faces).astype(b.dtype)
         b = b + boundary_load
@@ -773,7 +972,11 @@ def solve_poisson_dirichlet_3d(
     def apply_A(x):
         return A_bcoo @ x
 
-    u_int, info = jax_cg.cg(apply_A, b, maxiter=800, tol=1e-6)
+    x0 = None
+    if u_init is not None:
+        x0 = flatten_interior_3d(jnp.asarray(u_init, dtype=b.dtype))
+
+    u_int, info = jax_cg.cg(apply_A, b, x0=x0, maxiter=800, tol=1e-6)
     for _ in range(3):
         correction, _ = jax_cg.cg(apply_A, -(apply_A(u_int) - b), maxiter=800, tol=1e-6)
         u_int = u_int + correction
@@ -795,10 +998,10 @@ def solve_poisson_dirichlet_3d(
     return unflatten_interior_3d(grid, u_int, boundary_faces=boundary_faces), diagnostics
 
 
-def solve_hartree_dirichlet_3d(grid, rho: Array) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
+def solve_hartree_dirichlet_3d(grid, rho: Array, *, v_init: Array | None = None) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve the prototype Hartree problem -Laplace(V_H) = 4*pi*rho."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs)
+    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, u_init=v_init)
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     return V, diagnostics
@@ -811,6 +1014,7 @@ def solve_hartree_multipole_dirichlet_3d(
     r0: Array | None = None,
     center_mode: str = "box_center",
     min_radius: float = 1.0e-8,
+    v_init: Array | None = None,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve the prototype Hartree problem using multipole Dirichlet boundary data."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
@@ -821,7 +1025,7 @@ def solve_hartree_multipole_dirichlet_3d(
         center_mode=center_mode,
         min_radius=min_radius,
     )
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces)
+    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces, u_init=v_init)
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     diagnostics.update(face_diagnostics)
@@ -835,6 +1039,7 @@ def solve_hartree_monopole_dirichlet_3d(
     r0: Array | None = None,
     center_mode: str = "box_center",
     min_radius: float = 1.0e-8,
+    v_init: Array | None = None,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Backward-compatible monopole Hartree wrapper retained for regression."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
@@ -845,7 +1050,7 @@ def solve_hartree_monopole_dirichlet_3d(
         center_mode=center_mode,
         min_radius=min_radius,
     )
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces)
+    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces, u_init=v_init)
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     diagnostics.update(face_diagnostics)

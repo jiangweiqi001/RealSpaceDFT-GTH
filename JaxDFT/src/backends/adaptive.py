@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import sparse as jsparse
 
 from .base import ArrayLike, BackendState, NonlocalCache
@@ -133,6 +134,11 @@ class AdaptiveBackend:
         state.M_bcoo = jsparse.BCOO.from_scipy_sparse(M)
         state.A_nnz = int(A.nnz)
         state.M_nnz = int(M.nnz)
+        state.x_host = np.asarray(state.x, dtype=np.float64)
+        state.y_host = np.asarray(state.y, dtype=np.float64)
+        state.z_host = np.asarray(state.z, dtype=np.float64)
+        state.coords_host = np.asarray(state.coords, dtype=np.float64)
+        state.uniform_exterior_cache = {}
         return state
 
     def integrate(self, state: BackendState, field: ArrayLike) -> ArrayLike:
@@ -163,7 +169,7 @@ class AdaptiveBackend:
             return -0.5 * state.laplacian_symmetric(psi)
         raise ValueError(f"unsupported kinetic_mode {self.kinetic_mode!r}")
 
-    def solve_hartree(self, state: BackendState, rho: ArrayLike) -> ArrayLike:
+    def solve_hartree(self, state: BackendState, rho: ArrayLike, v_init: ArrayLike | None = None) -> ArrayLike:
         """Solve Hartree with the current adaptive box-Poisson prototype.
 
         The default path uses multipole Dirichlet boundary data, which is more
@@ -178,20 +184,21 @@ class AdaptiveBackend:
         remains unchanged.
         """
         if self.hartree_boundary_mode == "multipole_dirichlet":
-            V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho)
+            V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho, v_init=v_init)
             return V_h
         if self.hartree_boundary_mode == "monopole_dirichlet":
             V_h, _ = solve_hartree_monopole_dirichlet_3d(
                 state,
                 rho,
                 center_mode=self.hartree_center_mode,
+                v_init=v_init,
             )
             return V_h
         if self.hartree_boundary_mode == "zero_dirichlet":
-            V_h, _ = solve_hartree_dirichlet_3d(state, rho)
+            V_h, _ = solve_hartree_dirichlet_3d(state, rho, v_init=v_init)
             return V_h
         if self.hartree_boundary_mode == "uniform_exterior":
-            V_h, _ = solve_hartree_uniform_exterior_dirichlet_3d(state, rho)
+            V_h, _ = solve_hartree_uniform_exterior_dirichlet_3d(state, rho, v_init=v_init)
             return V_h
         raise ValueError(f"unsupported hartree_boundary_mode {self.hartree_boundary_mode!r}")
 

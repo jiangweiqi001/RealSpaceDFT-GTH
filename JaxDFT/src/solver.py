@@ -117,14 +117,21 @@ def _metric_symmetrize(mat):
     return 0.5 * (mat + mat.T)
 
 
-def _metric_orthonormalize(grid, backend, X, scale, eps=1e-8):
-    """Metric-orthonormalize a block of vectors using its small Gram matrix."""
+def _metric_orthonormalize_with_transform(grid, backend, X, scale, eps=1e-8):
+    """Metric-orthonormalize a block and return the linear transform used."""
     S = _metric_symmetrize(_metric_gram(grid, backend, X, X, scale))
     evals, evecs = jnp.linalg.eigh(S)
     eps = jnp.asarray(eps, dtype=evals.dtype)
     safe_evals = jnp.maximum(evals, eps)
     inv_sqrt = 1.0 / jnp.sqrt(safe_evals)
-    return X @ (evecs * inv_sqrt[None, :])
+    transform = evecs * inv_sqrt[None, :]
+    return X @ transform, transform
+
+
+def _metric_orthonormalize(grid, backend, X, scale, eps=1e-8):
+    """Metric-orthonormalize a block of vectors using its small Gram matrix."""
+    X_ortho, _ = _metric_orthonormalize_with_transform(grid, backend, X, scale, eps=eps)
+    return X_ortho
 
 
 def _metric_project_out(grid, backend, basis, vecs, scale):
@@ -220,11 +227,8 @@ def solve_orbitals_subspace(
                 R_ortho = jnp.linalg.qr(R_ortho)[0]
 
                 # 4) Expand subspace
-                HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R_ortho)
-
-                Z = jnp.concatenate([X, R_ortho], axis=1)
-                HZ = jnp.concatenate([HX, HR], axis=1)
-
+                HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
+                HZ = _dirichlet_project_block(grid, HZ)
                 # 5) Rayleigh-Ritz in expanded subspace
                 H_Z = Z.T @ HZ
                 H_Z = 0.5 * (H_Z + H_Z.T)
@@ -260,6 +264,78 @@ def solve_orbitals_subspace(
     X = _dirichlet_project_block(grid, X)
     HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
     HX = _dirichlet_project_block(grid, HX)
+
+    if not trace_enabled:
+        def cond_fun(state):
+            i, _, _, _, res_norm = state
+            return jnp.logical_and(i < max_iter, res_norm > tol)
+
+        def body_fun(state):
+            i, X, HX, _, _ = state
+
+            # 1) Rayleigh-Ritz in current metric-orthonormal subspace
+            H_sub = _metric_symmetrize(_metric_gram(grid, backend, X, HX, scale))
+            E, V_sub = jnp.linalg.eigh(H_sub)
+
+            X = X @ V_sub
+            HX = HX @ V_sub
+            X = _dirichlet_project_block(grid, X)
+            HX = _dirichlet_project_block(grid, HX)
+
+            # 2) Residual in current subspace
+            R = HX - X * E[None, :]
+            R = _dirichlet_project_block(grid, R)
+            res_vec = _metric_block_norms(grid, backend, R, scale)
+            res_norm = jnp.max(res_vec)
+
+            def done_branch(_):
+                return i + 1, X, HX, E, res_norm
+
+            def expand_branch(_):
+                # 3) Orthogonalize residuals against current subspace in metric W
+                R_ortho = _metric_project_out(grid, backend, X, R, scale)
+                R_ortho = _dirichlet_project_block(grid, R_ortho)
+                R_ortho = _metric_orthonormalize(grid, backend, R_ortho, scale)
+                R_ortho = _dirichlet_project_block(grid, R_ortho)
+
+                # 4) Expand and re-orthonormalize the full subspace for stability
+                Z0 = jnp.concatenate([X, R_ortho], axis=1)
+                Z0 = _dirichlet_project_block(grid, Z0)
+                Z = _metric_orthonormalize(grid, backend, Z0, scale)
+                Z = _dirichlet_project_block(grid, Z)
+                HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
+                HZ = _dirichlet_project_block(grid, HZ)
+
+                # 5) Rayleigh-Ritz in expanded metric-orthonormal subspace
+                H_Z = _metric_symmetrize(_metric_gram(grid, backend, Z, HZ, scale))
+                E_Z, V_Z = jnp.linalg.eigh(H_Z)
+
+                X_new = Z @ V_Z[:, :n_bands]
+                HX_new = HZ @ V_Z[:, :n_bands]
+                X_new = _dirichlet_project_block(grid, X_new)
+                HX_new = _dirichlet_project_block(grid, HX_new)
+                E_new = E_Z[:n_bands]
+
+                # 6) Residual after update
+                R_new = HX_new - X_new * E_new[None, :]
+                R_new = _dirichlet_project_block(grid, R_new)
+                res_vec_new = _metric_block_norms(grid, backend, R_new, scale)
+                res_norm_new = jnp.max(res_vec_new)
+
+                return i + 1, X_new, HX_new, E_new, res_norm_new
+
+            return jax.lax.cond(res_norm <= tol, done_branch, expand_branch, operand=None)
+
+        state0 = (
+            jnp.array(0, dtype=jnp.int32),
+            X,
+            HX,
+            jnp.full((n_bands,), jnp.inf, dtype=jnp.float32),
+            jnp.array(jnp.inf, dtype=jnp.float32),
+        )
+        _, X_final, _, E_final, _ = jax.lax.while_loop(cond_fun, body_fun, state0)
+        return E_final, X_final
+
     E = jnp.full((n_bands,), jnp.inf, dtype=jnp.float32)
     res_norm = jnp.array(jnp.inf, dtype=jnp.float32)
     i = 0
@@ -304,9 +380,9 @@ def solve_orbitals_subspace(
         R_ortho = _dirichlet_project_block(grid, R_ortho)
 
         # 4) Expand and re-orthonormalize the full subspace for stability
-        Z = jnp.concatenate([X, R_ortho], axis=1)
-        Z = _dirichlet_project_block(grid, Z)
-        Z = _metric_orthonormalize(grid, backend, Z, scale)
+        Z0 = jnp.concatenate([X, R_ortho], axis=1)
+        Z0 = _dirichlet_project_block(grid, Z0)
+        Z = _metric_orthonormalize(grid, backend, Z0, scale)
         Z = _dirichlet_project_block(grid, Z)
         HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
         HZ = _dirichlet_project_block(grid, HZ)
@@ -482,7 +558,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         rho_cur = _dirichlet_project_field(grid, rho_cur)
         
 
-        V_H = backend.solve_hartree(grid, rho_cur)
+        V_H = backend.solve_hartree(grid, rho_cur, v_init=V_H_prev)
         
         eps_xc, v_xc = lda_xc(rho_cur)
         V_eff = V_loc + V_H + v_xc
@@ -556,13 +632,13 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         return i + 1, rho_mixed, f_hist_cur, diff, eigvals, eigvecs, V_H, eps_xc, v_xc
 
     state0 = (i0, rho, f_hist, diff0, eigvals0, eigvecs0, V_H0, eps_xc0, v_xc0)
-    if getattr(backend, "name", None) == "uniform":
-        final_state = jax.lax.while_loop(cond, body, state0)
-        final_state = jax.lax.stop_gradient(final_state)
-    else:
+    if trace_enabled:
         final_state = state0
         while bool(cond(final_state)):
             final_state = body(final_state)
+    else:
+        final_state = jax.lax.while_loop(cond, body, state0)
+        final_state = jax.lax.stop_gradient(final_state)
     _, rho, _, diff, eigvals, eigvecs, V_H, eps_xc, v_xc = final_state
     
     return rho, eigvals, eigvecs, V_H, eps_xc, v_xc
