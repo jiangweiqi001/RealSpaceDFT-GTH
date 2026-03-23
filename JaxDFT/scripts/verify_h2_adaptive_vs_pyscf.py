@@ -1,10 +1,10 @@
-"""Adaptive H2 vs PySCF curve verification.
+"""Adaptive H2 vs PySCF near-equilibrium verification.
 
-This mirrors the intent and plotting style of verify_h2.py, but compares:
+This mirrors the intent and plotting style of verify_h2.py, but compares only:
   - Adaptive RealSpace
   - PySCF reference
 
-It prints a compact terminal table, writes a CSV, and saves a PNG figure.
+The default scan is intentionally small and focused near equilibrium.
 """
 
 from __future__ import annotations
@@ -36,23 +36,23 @@ except ImportError:
     from src.solver import energy_and_forces
 
 
-DEFAULT_DISTANCES = [0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2]
+DEFAULT_DISTANCES = [1.2, 1.4, 1.6]
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Verify adaptive H2 curve against the PySCF reference used in verify_h2.py.",
+        description="Verify a small-range adaptive H2 curve against the PySCF reference used in verify_h2.py.",
     )
     parser.add_argument(
         "--dist",
         type=float,
         nargs="+",
         default=None,
-        help="Bond lengths in Bohr. Default follows verify_h2.py.",
+        help="Bond lengths in Bohr. Default: 1.2 1.4 1.6",
     )
     parser.add_argument("--box", type=float, default=30.0, help="Adaptive cubic box length in Bohr. Default: 30.0")
-    parser.add_argument("--h-min", type=float, default=0.25, help="Adaptive h_min. Default: 0.25")
-    parser.add_argument("--h-max", type=float, default=0.80, help="Adaptive h_max. Default: 0.80")
+    parser.add_argument("--h-min", type=float, default=0.16, help="Adaptive h_min. Default: 0.16")
+    parser.add_argument("--h-max", type=float, default=0.32, help="Adaptive h_max. Default: 0.32")
     parser.add_argument("--r-core", type=float, default=1.0, help="Adaptive r_core. Default: 1.0")
     parser.add_argument("--stretch-beta", type=float, default=5.0, help="Adaptive stretch beta. Default: 5.0")
     parser.add_argument(
@@ -69,15 +69,15 @@ def parse_args() -> argparse.Namespace:
         choices=["prototype_fd2", "symmetric_fv"],
         help="Adaptive kinetic mode. Default: prototype_fd2",
     )
-    parser.add_argument("--max-iter", type=int, default=4, help="SCF max iterations. Default: 4")
+    parser.add_argument("--max-iter", type=int, default=120, help="SCF max iterations. Default: 120")
     parser.add_argument("--mix-alpha", type=float, default=0.30, help="SCF mixing alpha. Default: 0.30")
-    parser.add_argument("--tolerance", type=float, default=5.0e-4, help="SCF tolerance. Default: 5e-4")
+    parser.add_argument("--tolerance", type=float, default=1.0e-5, help="SCF tolerance. Default: 1e-5")
     parser.add_argument("--seed", type=int, default=42, help="Base PRNG seed. Default: 42")
     parser.add_argument(
         "--out-prefix",
         type=str,
-        default="h2_adaptive_vs_pyscf",
-        help="Output prefix for CSV/PNG files. Default: h2_adaptive_vs_pyscf",
+        default="h2_adaptive_vs_pyscf_near_eq",
+        help="Output prefix for CSV/PNG files. Default: h2_adaptive_vs_pyscf_near_eq",
     )
     return parser.parse_args()
 
@@ -182,12 +182,89 @@ def combined_status(adaptive: dict[str, Any], pyscf: dict[str, Any]) -> str:
     return pyscf.get("status", "pyscf_failed")
 
 
+def plot_energy_curve(path: str, rows: list[dict[str, Any]]) -> None:
+    adaptive_x = [row["R"] for row in rows if row["E_adaptive"] is not None]
+    adaptive_y = [row["E_adaptive"] for row in rows if row["E_adaptive"] is not None]
+    pyscf_x = [row["R"] for row in rows if row["E_pyscf"] is not None]
+    pyscf_y = [row["E_pyscf"] for row in rows if row["E_pyscf"] is not None]
+
+    plt.figure(figsize=(8, 5))
+    if adaptive_x:
+        plt.plot(adaptive_x, adaptive_y, "o-", linewidth=2, label="Adaptive (RealSpace)")
+    if pyscf_x:
+        plt.plot(pyscf_x, pyscf_y, "x--", linewidth=2, label="PySCF Reference")
+    plt.xlabel("Bond Length (Bohr)")
+    plt.ylabel("Total Energy (Hartree)")
+    plt.title("H2 Near Equilibrium: Adaptive vs PySCF")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def plot_error_curve(path: str, rows: list[dict[str, Any]]) -> None:
+    dE_x = [row["R"] for row in rows if row["dE"] is not None]
+    dE_y = [row["dE"] for row in rows if row["dE"] is not None]
+
+    plt.figure(figsize=(8, 5))
+    if dE_x:
+        plt.plot(dE_x, dE_y, "o-", linewidth=2, label="dE = Adaptive - PySCF")
+        plt.axhline(0.0, color="black", linestyle="--", alpha=0.6)
+    plt.xlabel("Bond Length (Bohr)")
+    plt.ylabel("Energy Error (Hartree)")
+    plt.title("H2 Near Equilibrium: Adaptive Error vs PySCF")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+
+
+def summarize(rows: list[dict[str, Any]]) -> None:
+    valid_rows = [row for row in rows if row["dE"] is not None]
+    print("\n=== Summary ===")
+    for row in rows:
+        de = row["dE"]
+        if de is None:
+            print(f"R={row['R']:.2f}: dE = failed ({row['status']})")
+        else:
+            print(f"R={row['R']:.2f}: dE = {de:.6f} Ha ({de * 1000.0:.3f} mHa)")
+
+    if not valid_rows:
+        print("No valid adaptive/PySCF overlap points were produced.")
+        return
+
+    all_mha = all(abs(row["dE"]) < 1.0e-3 for row in valid_rows)
+    adaptive_min_row = min(
+        (row for row in rows if row["E_adaptive"] is not None),
+        key=lambda row: row["E_adaptive"],
+        default=None,
+    )
+    curve_smooth = (
+        len(valid_rows) == 3
+        and rows[1]["E_adaptive"] is not None
+        and rows[0]["E_adaptive"] is not None
+        and rows[2]["E_adaptive"] is not None
+        and rows[1]["E_adaptive"] <= rows[0]["E_adaptive"]
+        and rows[1]["E_adaptive"] <= rows[2]["E_adaptive"]
+    )
+    min_reasonable = adaptive_min_row is not None and 1.2 <= adaptive_min_row["R"] <= 1.6
+
+    print(f"all points in mHa regime: {'yes' if all_mha else 'no'}")
+    print(f"curve smooth near equilibrium: {'yes' if curve_smooth else 'no'}")
+    if adaptive_min_row is not None:
+        print(f"adaptive minimum among sampled points: R = {adaptive_min_row['R']:.2f} Bohr")
+    print(f"minimum stays in reasonable interval [1.2, 1.6]: {'yes' if min_reasonable else 'no'}")
+
+
 def main() -> int:
     args = parse_args()
     distances = [float(x) for x in (args.dist if args.dist is not None else DEFAULT_DISTANCES)]
     ensure_parent_dir(args.out_prefix)
     csv_path = f"{args.out_prefix}.csv"
     png_path = f"{args.out_prefix}.png"
+    de_png_path = f"{args.out_prefix}_dE.png"
 
     pseudo_dir = os.path.join(project_root, "JaxDFT", "data", "gth_potentials")
     base_pseudos = load_pseudopotentials(["H"], pseudo_dir)
@@ -244,27 +321,13 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(rows)
 
-    adaptive_x = [row["R"] for row in rows if row["E_adaptive"] is not None]
-    adaptive_y = [row["E_adaptive"] for row in rows if row["E_adaptive"] is not None]
-    pyscf_x = [row["R"] for row in rows if row["E_pyscf"] is not None]
-    pyscf_y = [row["E_pyscf"] for row in rows if row["E_pyscf"] is not None]
+    plot_energy_curve(png_path, rows)
+    plot_error_curve(de_png_path, rows)
+    summarize(rows)
 
-    plt.figure(figsize=(10, 6))
-    if adaptive_x:
-        plt.plot(adaptive_x, adaptive_y, "o-", linewidth=2, label="Adaptive (RealSpace)")
-    if pyscf_x:
-        plt.plot(pyscf_x, pyscf_y, "x--", linewidth=2, label="PySCF Reference")
-    plt.xlabel("Bond Length (Bohr)")
-    plt.ylabel("Total Energy (Hartree)")
-    plt.title("H2 Dissociation: Adaptive RealSpace vs PySCF")
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(png_path, dpi=150)
-    plt.close()
-
-    print(f"Saved CSV: {csv_path}")
-    print(f"Saved PNG: {png_path}")
+    print(f"\nSaved CSV: {csv_path}")
+    print(f"Saved energy PNG: {png_path}")
+    print(f"Saved dE PNG: {de_png_path}")
     return 0
 
 
