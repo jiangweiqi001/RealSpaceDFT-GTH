@@ -41,6 +41,11 @@ except ImportError:
 SMALL = 1.0e-12
 
 
+def case_key(seed: int, case_index: int) -> jax.Array:
+    """Return a reproducible per-geometry key shared across verification scripts."""
+    return jax.random.fold_in(jax.random.PRNGKey(seed), int(case_index))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check H2 R=1.4 Bohr adaptive vs uniform vs PySCF energy breakdown.",
@@ -331,7 +336,7 @@ def main() -> int:
         n_bands,
         occ,
         args,
-        jax.random.PRNGKey(args.seed),
+        case_key(args.seed, 0),
     )
 
     uniform_backend = UniformBackend()
@@ -345,7 +350,7 @@ def main() -> int:
         n_bands,
         occ,
         args,
-        jax.random.PRNGKey(args.seed),
+        case_key(args.seed, 0),
     )
 
     pyscf = run_pyscf_total_only(args.R)

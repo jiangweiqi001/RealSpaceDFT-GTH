@@ -227,8 +227,11 @@ def solve_orbitals_subspace(
                 R_ortho = jnp.linalg.qr(R_ortho)[0]
 
                 # 4) Expand subspace
-                HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
-                HZ = _dirichlet_project_block(grid, HZ)
+                HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R_ortho)
+
+                Z = jnp.concatenate([X, R_ortho], axis=1)
+                HZ = jnp.concatenate([HX, HR], axis=1)
+
                 # 5) Rayleigh-Ritz in expanded subspace
                 H_Z = Z.T @ HZ
                 H_Z = 0.5 * (H_Z + H_Z.T)

@@ -39,6 +39,11 @@ except ImportError:
 DEFAULT_DISTANCES = [1.2, 1.4, 1.6]
 
 
+def case_key(seed: int, case_index: int) -> jax.Array:
+    """Return a reproducible per-geometry key shared across verification scripts."""
+    return jax.random.fold_in(jax.random.PRNGKey(seed), int(case_index))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Verify a small-range adaptive H2 curve against the PySCF reference used in verify_h2.py.",
@@ -274,8 +279,6 @@ def main() -> int:
         hartree_boundary_mode=args.hartree_boundary_mode,
         kinetic_mode=args.kinetic_mode,
     )
-    base_key = jax.random.PRNGKey(args.seed)
-
     print(f"\n{'=' * 20} Adaptive H2 vs PySCF {'=' * 20}")
     print(f"distances = {distances}")
     print(
@@ -290,7 +293,7 @@ def main() -> int:
     rows: list[dict[str, Any]] = []
     for idx, dist in enumerate(distances):
         coords = jnp.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, dist]], dtype=jnp.float32)
-        dist_key = jax.random.fold_in(base_key, idx)
+        dist_key = case_key(args.seed, idx)
         adaptive = run_adaptive_case(backend, coords, pseudos, args, dist_key)
         pyscf = run_pyscf_verify_h2_style(dist)
         status = combined_status(adaptive, pyscf)
