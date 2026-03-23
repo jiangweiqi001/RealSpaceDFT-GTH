@@ -1,572 +1,434 @@
-# JaxDFT 工具包算法文档
+﻿# ALGORITHM
 
-## 概述
+## 1. 整体目标
 
-JaxDFT 是一个基于 **JAX** 实现的实空间 (Real-Space) 密度泛函理论 (DFT) 计算包，专为孤立体系 (Isolated Systems) 设计，采用开边界条件 (Open Boundary Conditions) 和 Dirichlet 边界条件。
+本仓库实现的是一个面向**孤立分子体系**的实空间 Kohn–Sham DFT 原型。当前同时维护两条路线：
 
----
+- **Uniform Grid**：稳定、易解释、便于与 PySCF 对齐的基线方案。
+- **Adaptive Tensor Grid**：在保持张量积结构的前提下，把节点集中到原子附近，减少真空区不必要的自由度。
 
-## 1. DFT计算方法
+当前 adaptive 路线的目标不是“先把功能堆齐”，而是：
 
-### 1.1 整体流程
+1. 逼近 uniform 路线的数值稳定性；
+2. 在 H2 这类小分子基准上逼近 PySCF 的总能与曲线趋势；
+3. 在不破坏精度的前提下逐步降低 wall time。
 
-JaxDFT 采用标准的 Kohn-Sham DFT 自洽场 (SCF) 迭代方法：
+因此，本文档只记录**当前 main 分支真实存在的实现**，并明确区分：
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     SCF 迭代循环                             │
-├─────────────────────────────────────────────────────────────┤
-│  1. 初始化电子密度 ρ(r)                                       │
-│  2. 构建有效势 V_eff = V_loc + V_H + V_xc + V_nonlocal       │
-│  3. 求解 Kohn-Sham 方程: Hψ_i = ε_iψ_i                       │
-│  4. 计算新密度: ρ_new = Σ|ψ_i|² × occ_i                      │
-│  5. Anderson 密度混合 → 更新密度                              │
-│  6. 检查收敛性 (|ρ_new - ρ| < tolerance)                     │
-│  7. 未收敛则返回步骤 2                                        │
-└─────────────────────────────────────────────────────────────┘
-```
+- 当前默认行为；
+- 当前常用验证配置；
+- 实验性/可选路径；
+- 已尝试但当前不作为主线推进的路线。
 
-### 1.2 实空间网格 (Real-Space Grid)
+## 2. 离散对象与主要模块
 
-- **网格生成**: 使用 `create_grid(spacing, box_size)` 创建均匀三维网格
-- **网格坐标**: 以原点为中心，`x, y, z ∈ [-box_size/2, box_size/2]`
-- **体素体积**: `volume_element = spacing³` (单位: Bohr³)
+### 2.1 Uniform grid
 
-### 1.3 动能算符 - 四阶有限差分
+对应模块与入口：
+- `JaxDFT/src/backends/uniform.py`
+- `JaxDFT/src/hamiltonian.py`
 
-采用 **4阶中心差分** 计算拉普拉斯算符（动能项）:
+主要特征：
+- 均匀笛卡尔网格；
+- `laplacian_8th` 作为 kinetic 主算子；
+- FFT Hartree / Poisson 路径；
+- 作为 PySCF 对比、spacing sweep 与很多回归检查的基线。
 
-```
-∇²ψ ≈ c₀·ψ(i,j,k)
-    + c₁·[ψ(i±1,j,k) + ψ(i,j±1,k) + ψ(i,j,k±1)]
-    + c₂·[ψ(i±2,j,k) + ψ(i,j±2,k) + ψ(i,j,k±2)]
+### 2.2 Adaptive tensor grid
 
-其中:
-  c₀ = -2.5 / h²
-  c₁ = (4/3) / h²
-  c₂ = (-1/12) / h²
-  h = grid spacing
-```
+对应模块与入口：
+- `JaxDFT/src/grids/adaptive_tensor.py`
+- `JaxDFT/src/backends/adaptive.py`
 
-**特点**:
-- 非周期性边界，采用 **Dirichlet 边界条件** (边界处 ψ = 0)
-- 通过 `shift_array` 函数处理边界截断
+主要特征：
+- 每个坐标轴单独重分布；
+- 仍保持 3D 张量积结构，不是非结构网格；
+- 节点、积分权重、体元权重都由 adaptive 轴构造；
+- adaptive 路线所有积分、内积、非局域投影重叠都显式使用权重。
 
-### 1.4 势能组成部分
+### 2.3 Local / nonlocal pseudopotential
 
-#### 1.4.1 局域离子势 (GTH Local Potential)
+对应模块：
+- `JaxDFT/src/hamiltonian.py`
+- `JaxDFT/src/io.py`
 
-GTH (Goedecker-Teter-Hutter) 局域赝势形式:
+当前主要使用：
+- GTH-LDA 赝势；
+- 局域势直接在网格点坐标上评估；
+- 非局域势通过 projector 预计算并在 SCF 内重用。
 
-```
-V_loc(r) = -Z_ion/r · erf(r/(√2·r_loc)) + exp(-(r/r_loc)²/2) × Σ c_i·(r/r_loc)^(2i)
-```
+### 2.4 Hartree / Poisson
 
-参数说明:
-- `Z_ion`: 离子有效电荷 (价电子数)
-- `r_loc`: 局域势半径参数
-- `c = [c₁, c₂, c₃, c₄]`: 高斯多项式系数
+- Uniform 路线：FFT Poisson。
+- Adaptive 路线：`JaxDFT/src/grids/adaptive_poisson.py` 中的 box-Poisson 原型。
 
-#### 1.4.2 非局域势 (GTH Nonlocal Potential)
+adaptive Hartree 当前支持多种边界提供器：
+- `zero_dirichlet`
+- `monopole_dirichlet`
+- `multipole_dirichlet`
+- `uniform_exterior`
 
-支持 l=0 (s通道) 和 l=1 (p通道) 的非局域投影:
+### 2.5 SCF loop
 
-```
-V_nonlocal ψ = Σ_{i,j,l,m} |p_i^{lm}⟩ h_{ij}^l ⟨p_j^{lm}|ψ⟩
-```
+对应模块：
+- `JaxDFT/src/solver.py`
 
-投影函数形式:
-```
-p_i^l(r) = N_{il} · r^(l+2i-2) · exp(-r²/(2r_p²))
+SCF 主循环负责：
+- 初始化 `rho`
+- 构造 `V_H + v_xc`
+- 调用轨道求解器
+- 重建新密度
+- Anderson mixing
+- 收敛判定
 
-归一化系数:
-N_{il} = √2 / (r_p^(l+(4i-1)/2) · √Γ(l+(4i-1)/2))
-```
+### 2.6 Orbital solver / subspace eigensolver
 
-支持全矩阵 `h_{ij}` 计算（多个投影器之间的耦合）。
+对应模块：
+- `JaxDFT/src/solver.py::solve_orbitals_subspace`
 
-#### 1.4.3 Hartree 势 (库仑势)
+当前使用的是一个 block subspace + Rayleigh–Ritz 的迭代本征求解器，不是严格教科书意义上的完整 LOBPCG，但保留了：
+- 当前子空间内 Rayleigh–Ritz
+- 残差构造
+- 子空间扩展与再正交化
+- 更新后的低维 Ritz 截断
 
-采用 **Hockney 补零 FFT 法** 求解泊松方程:
+## 3. 当前 adaptive 方法的真实实现
 
-```python
-# 1. 对密度进行 2 倍零填充
-rho_pad = pad(rho, 2x size)
+## 3.1 Adaptive grid 的参数化
 
-# 2. 构建库仑核并 FFT
-kernel(r) = 1/r  (r>0),  2.38/spacing  (r≈0)
-V_H = IFFT(FFT(rho_pad) × FFT(kernel)) × spacing³
+当前 adaptive 轴的核心参数是：
+- `h_min`
+- `h_max`
+- `r_core`
+- `stretch_beta`
 
-# 3. 截取有效区域
-V_H = V_H[:nx, :ny, :nz]
-```
-
-**关键特性**:
-- 消除周期性镜像相互作用
-- 实现真正的孤立体系计算
-
-#### 1.4.4 交换相关势 (XC)
+它们的角色如下：
 
-采用 **LDA (Local Density Approximation)**:
-- **交换项**: Slater 交换 (`lda_exchange_vxc`)
-  ```
-  V_x = -(3/π)^(1/3) · ρ^(1/3)
-  ε_x = 3/4 · V_x · ρ
-  ```
-
-- **相关项**: Perdew-Zunger 1981 (PZ81) 参数化
-  ```
-  高密度 (r_s < 1): 对数多项式形式
-  低密度 (r_s ≥ 1): 有理分式形式
-
-  r_s = (3/(4πρ))^(1/3)  # Wigner-Seitz 半径
-  ```
+- `h_min`
+  - 近核区域允许达到的最细间距；
+- `h_max`
+  - 远离原子的背景间距上限；
+- `r_core`
+  - 近核细化的空间尺度；
+- `stretch_beta`
+  - 控制从核附近向外过渡时的 spacing profile 强度。
+
+实现上，adaptive 轴不是手工分段网格，而是：
+1. 在一条致密参考轴上构造 local spacing profile；
+2. 用类似 monitor function 的累计积分重分布节点；
+3. 得到严格单调的 1D adaptive 轴；
+4. 组合成 3D tensor grid。
 
-### 1.5 Kohn-Sham 方程求解
+## 3.2 权重、积分和密度口径
 
-#### 1.5.1 LOBPCG 迭代求解器
+当前 adaptive 方案里的几个关键量：
 
-使用带 Rayleigh-Ritz 子空间对角化的安全梯度下降法:
-
-```
-1. 初始化随机波函数 X (加微小噪声打破对称性)
-2. 正交化: X = QR(X)
-3. 迭代直到收敛:
-   a. 计算 HX = H(X)
-   b. Rayleigh-Ritz: 在子空间 [X] 中对角化 H_sub = XᵀHX
-   c. 更新波函数: X = X · V_sub (特征向量矩阵)
-   d. 计算残差: R = HX - X·E
-   e. 梯度更新: X_new = X - α·R  (α=0.002)
-   f. 重新正交化
-```
-
-#### 1.5.2 稠密矩阵求解器 (备选)
-
-对于小规模网格 (N ~ 20,000)，可构建完整哈密顿矩阵:
-```
-H_dense = [H·e₁, H·e₂, ..., H·e_N]  (N×N 矩阵)
-对角化: H_dense · ψ = E · ψ
-```
-
-### 1.6 密度混合 (Anderson Mixing)
-
-使用 Anderson 混合加速 SCF 收敛:
-
-```
-f = ρ_new - ρ  (残差)
-
-第一次迭代: 简单线性混合
-  ρ_next = ρ + α·f
-
-后续迭代 (存储 m=5 步历史):
-  最小化 ||f_next||² 得到最优系数 θ
-  ρ_next = ρ_new - α·Σ θ_i·(f_i - f_current)
-```
-
-### 1.7 总能量计算
-
-```
-E_total = E_band - E_Hartree + E_xc - E_vxc + E_ion-ion
-
-其中:
-  E_band = Σ ε_i · occ_i                    (能带能量和)
-  E_Hartree = 0.5 ∫ ρ·V_H dr                (Hartree 能量)
-  E_xc = ∫ ε_xc(ρ)·ρ dr                     (XC 能量)
-  E_vxc = ∫ V_xc(ρ)·ρ dr                    (XC 势修正)
-  E_ion-ion = Σ_{i<j} Z_i·Z_j / |R_i-R_j|   (离子排斥)
-```
-
----
-
-## 2. 与其他DFT工具的区别
-
-| 特性 | JaxDFT | 传统DFT (如PySCF/Quantum ESPRESSO) |
-|------|--------|-----------------------------------|
-| **空间表示** | 实空间网格 | 平面波 / 高斯基组 |
-| **边界条件** | 孤立体系 (Dirichlet) | 周期性 (PBC) 或混合 |
-| **泊松求解** | Hockney 补零 FFT | FFT (周期性) / 直接积分 |
-| **自动微分** | JAX 原生支持 | 有限差分或专门实现 |
-| **赝势** | GTH 实空间投影 | 多种赝势格式 |
-| **XC 泛函** | LDA-PZ81 | 多种泛函可选 |
-
-### 2.1 实空间 vs 平面波
-
-**JaxDFT (实空间)**:
-- ✅ 自然处理孤立体系，无镜像相互作用
-- ✅ 非周期性边界，适合分子/团簇
-- ✅ 局部势能计算直接、高效
-- ❌ 动能计算需要更多网格点保证精度
-
-**平面波 (如 Quantum ESPRESSO)**:
-- ✅ 动能计算精确
-- ✅ 周期性体系自然适配
-- ❌ 孤立体系需要大真空层和校正
-- ❌ 非局域势计算复杂
-
-### 2.2 边界条件对比
-
-**JaxDFT (开边界)**:
-```
-盒子边界: ψ(r) = 0
-Hartree 势: Hockney 方法消除镜像
-```
-
-**传统 PBC**:
-```
-ψ(r+L) = ψ(r)
-Hartree 势: 包含周期性镜像求和 (Ewald)
-```
-
----
-
-## 3. 使用方法和外部变量说明
-
-### 3.1 基本使用流程
-
-```python
-import jax
-import jax.numpy as jnp
-from JaxDFT.src.hamiltonian import create_grid
-from JaxDFT.src.io import load_pseudopotentials
-from JaxDFT.src.solver import energy_and_forces
-
-# 1. 创建网格
-spacing = 0.5          # 网格间距 (Bohr)
-box_size = [10, 10, 10]  # 盒子大小 (Bohr)
-grid = create_grid(spacing, box_size)
-
-# 2. 加载赝势
-pseudos = load_pseudopotentials(['H', 'C'], 'path/to/potentials')
-
-# 3. 设置原子坐标 (Bohr)
-coords = jnp.array([[0.0, 0.0, 0.0],    # H
-                    [1.4, 0.0, 0.0]])   # C
-
-# 4. 运行 SCF 计算
-key = jax.random.PRNGKey(42)
-energy, forces = energy_and_forces(
-    grid,
-    coords,
-    pseudos,
-    max_iter=100,    # 最大迭代次数
-    mix_alpha=0.4,   # 混合参数
-    tolerance=1e-5,  # 收敛阈值
-    key=key
-)
+- `wx, wy, wz`
+  - 1D nodal trapezoidal weights；
+- `volume_weights`
+  - 三维张量积体元权重；
+- `grid.integrate(field)`
+  - 统一用 `volume_weights` 积分；
+- `grid.inner_product(x, y)`
+  - 统一用加权内积；
+- 非局域 projector overlap
+  - 也走加权积分口径。
 
-print(f"总能量: {energy:.6f} Hartree")
-```
-
-### 3.2 外部变量说明
+因此，adaptive 路线下：
+- `rho` 的积分、电子数、Hartree 能量、局域能量、XC 能量、非局域能量，都必须显式经过 backend 的加权积分接口；
+- 不能把 adaptive 场当作“只是坐标不均匀，但可以用普通求和代替积分”。
 
-#### 网格参数
+## 3.3 Adaptive kinetic 的当前实现
 
-| 变量 | 类型 | 单位 | 说明 |
-|------|------|------|------|
-| `spacing` | float | Bohr | 网格间距，决定计算精度 |
-| `box_size` | [float, float, float] | Bohr | 模拟盒子尺寸 [Lx, Ly, Lz] |
-| `grid.shape` | (int, int, int) | - | 网格点数 [Nx, Ny, Nz] |
-| `volume_element` | float | Bohr³ | 单个体素体积 = spacing³ |
+`AdaptiveBackend` 当前暴露两种 kinetic mode：
 
-#### SCF 参数
+### 3.3.1 `prototype_fd2`（当前主线）
+- 对应 `state.laplacian(...)`
+- 是当前 adaptive 路线的主线 kinetic 配置
+- 当前所有主要 H2 验证脚本都以它为默认/推荐配置
 
-| 变量 | 类型 | 典型值 | 说明 |
-|------|------|--------|------|
-| `max_iter` | int | 100-500 | 最大SCF迭代次数 |
-| `mix_alpha` | float | 0.3-0.5 | Anderson混合强度，越大收敛越快但可能不稳定 |
-| `tolerance` | float | 1e-5 to 1e-6 | 密度收敛阈值 (max\|Δρ\|) |
-| `n_bands` | int | auto | 计算的Kohn-Sham轨道数，自动设为 ceil(N_electrons/2) |
+### 3.3.2 `symmetric_fv`（实验性）
+- 对应 `state.laplacian_symmetric(...)`
+- 是一个更偏 finite-volume / lumped-FEM 风格、在加权内积下更接近自伴的尝试
+- 目前保留在代码中，但没有作为主线默认配置推进
+- 原因是：它在 frozen-Veff 下出现过正向信号，但未稳定转化为真实 adaptive SCF 的明确增益
 
-#### 赝势参数 (GTH)
+## 3.4 Adaptive Hartree 的当前实现
 
-| 变量 | 类型 | 说明 |
-|------|------|------|
-| `q` | int | 价电子数 |
-| `zion` | float | 离子有效电荷 (=q) |
-| `rloc` | float | 局域势半径 (Bohr) |
-| `c` | [float] | 局域势多项式系数 [c₁, c₂, c₃, c₄] |
-| `projectors` | list | 非局域投影器列表，每个包含 `l`, `r`, `h` |
+`AdaptiveBackend.solve_hartree(...)` 当前支持：
+- `multipole_dirichlet`
+- `monopole_dirichlet`
+- `zero_dirichlet`
+- `uniform_exterior`
 
-#### 物理量单位
+### 3.4.1 代码默认
 
-所有物理量采用 **原子单位制 (Hartree Atomic Units)**:
+`AdaptiveBackend()` 的默认构造参数仍是：
+- `hartree_boundary_mode="multipole_dirichlet"`
+- `kinetic_mode="prototype_fd2"`
 
-| 量 | 单位 | 换算 |
-|----|------|------|
-| 长度 | Bohr | 1 Bohr ≈ 0.529 Å |
-| 能量 | Hartree | 1 Ha ≈ 27.2114 eV ≈ 627.5 kcal/mol |
-| 力 | Hartree/Bohr | 1 Ha/Bohr ≈ 51.4 eV/Å |
-| 密度 | Bohr⁻³ | |
+### 3.4.2 当前常用 H2 验证配置
 
-### 3.3 配置文件格式 (YAML)
+虽然 backend 默认还是 `multipole_dirichlet`，但当前 H2 主验证通常显式使用：
+- `hartree_boundary_mode="uniform_exterior"`
+- `kinetic_mode="prototype_fd2"`
 
-```yaml
-grid:
-  spacing: 0.5          # 网格间距 (Bohr)
-  box_size: [10.0, 10.0, 10.0]  # 盒子大小 (Bohr)
+原因不是说 `multipole_dirichlet` 完全不可用，而是：
+- `uniform_exterior` 在当前 H2 上通常更接近我们想要的 isolated-like adaptive Hartree 路径；
+- 它是目前 adaptive H2 主验证里更常用的边界提供器。
 
-sampling:
-  n_samples: 10         # 采样数量
-  min_distance: 1.5     # 最小原子间距 (Bohr)
+### 3.4.3 `uniform_exterior` 的实现口径
 
-elements: ['H', 'C', 'N', 'O', 'Si']  # 可用元素
+`uniform_exterior` 不是把 adaptive interior operator 换掉，而是：
+- 保留 adaptive interior Poisson operator；
+- 通过一个更大、更粗的 auxiliary uniform exterior free-space-like 求解来提供 adaptive box 六个面的 Dirichlet 边界值；
+- 然后把这些 face values 喂回 adaptive interior solve。
 
-scf:
-  max_iter: 100         # 最大迭代
-  mix_alpha: 0.4        # 混合参数
-  tolerance: 1.0e-5     # 收敛阈值
-```
+因此它仍是一个 **finite-box adaptive interior + exterior face provider** 的路线，不是精确的全空间 Green’s-function Hartree。
 
----
+## 3.5 SCF 主循环的当前实现特征
 
-## 4. 外部变量使用注意事项
+当前 `solver.py::scf(...)` 的 adaptive 路径有几个必须写清楚的实现特征：
 
-### 4.1 网格参数选择
+1. **初始密度**
+   - 按原子位置生成 Gaussian-like 初猜；
+   - 再归一化到总电子数；
+   - 再投影到 Dirichlet mask。
 
-#### spacing (网格间距)
+2. **Hartree warm-start**
+   - 当前 main 默认保留；
+   - 每一轮 adaptive Hartree 求解允许使用上一轮 `V_H` 作为 `v_init`。
 
-| 值 | 适用场景 | 精度 | 计算成本 |
-|----|---------|------|---------|
-| 0.3 | 高精度计算 | 高 | 高 |
-| 0.5 | 标准精度 | 中 | 中 |
-| 0.8 | 快速测试 | 低 | 低 |
+3. **XC**
+   - 当前主线是 `lda_xc(rho)`。
 
-**注意事项**:
-- 网格越密，动能计算越精确
-- 推荐值: **0.18-0.5 Bohr** 用于生产计算
-- 必须满足 Nyquist 准则: spacing < π/k_max
+4. **轨道求解器调用**
+   - 每轮 SCF 都调用 `solve_orbitals_subspace(...)`；
+   - `x_init` 使用上一轮 `eigvecs`；
+   - adaptive 路径当前常用内部参数大致是：
+     - `orbital_max_iter = 8`
+     - `orbital_tol = 1e-4`
 
-#### box_size (盒子大小)
+5. **密度 mixing**
+   - 当前使用 Anderson mixing；
+   - 历史长度是固定的小窗口；
+   - 不是专门为 adaptive 另写的一套 mixing。
 
-**重要**:
-- 盒子必须足够大，使波函数在边界衰减到接近零
-- 对于分子，建议至少保留 **5-10 Bohr** 真空层
-- 盒子过小会导致边界效应和能量误差
+6. **Dirichlet 投影**
+   - 当前 main 已经把 orbitals、残差、`Hpsi`、`rho` 等关键量都投影到 mask 上；
+   - 这是修掉早期 adaptive 边界异常贴边问题之后的实现状态。
 
-```python
-# 检查盒子大小是否合适
-# 对于典型的共价键分子，盒子应满足:
-min_box = molecular_extent + 10.0  # Bohr
-```
+## 3.6 当前保留的性能优化
 
-### 4.2 SCF 收敛调优
+以下性能改动目前保留在 main：
 
-#### mix_alpha (混合参数)
+- adaptive SCF 外层 `jax.lax.while_loop`
+- adaptive metric eigensolver `jax.lax.while_loop`
+- adaptive Hartree warm-start
+- `uniform_exterior` 相关缓存
+- adaptive grid host metadata 缓存
+- trace/debug 默认关闭，热路径尽量避免 Python-side finite checks
 
-- **值过小 (如 0.1)**: 收敛慢但稳定
-- **值过大 (如 0.8)**: 可能振荡或发散
-- **推荐**: 从 0.3-0.4 开始，不收敛时减小
+需要特别说明的是：
+- **adaptive metric eigensolver 中的 `HX/HR` 复用优化已经回退**；
+- 它曾经带来可见的精度回退，因此不是当前 main 保留的优化。
 
-#### tolerance (收敛阈值)
+## 4. 边界条件问题的演化
 
-- **1e-5**: 标准精度
-- **1e-6**: 高精度
-- **注意**: 过度收紧 (如 1e-8) 可能难以收敛且收益有限
+## 4.1 早期问题
 
-#### max_iter (最大迭代)
+adaptive 路线早期最显著的问题包括：
+- Hartree 边界模型太粗；
+- 自适应轨道在边界上出现不合理行为；
+- H2 的 box sensitivity 很强。
 
-- 简单体系: 50-100 次足够
-- 困难体系 (金属性、小分子): 可能需要 200-500 次
+这些问题曾触发过大量边界条件、center choice、multipole、exterior treatment 的专项审计。
 
-### 4.3 赝势注意事项
+## 4.2 后续修正
 
-#### 非局域势投影器
+后续 main 上已经落实的关键修正包括：
+- solver 内的真 Dirichlet 投影机制；
+- `uniform_exterior` boundary provider；
+- 多个 H2 单点审计脚本，用来把 Hartree、`V_loc`、`v_xc`、SCF 口径问题彼此拆开。
 
-- `h` 矩阵可以是对角矩阵或全矩阵
-- 对于轻元素 (H, He)，通常只有 s 通道
-- 对于重元素，需要 s 和 p 通道
+## 4.3 当前边界条件的真实限制
 
-#### 赝势文件格式
+当前代码状态下，边界问题不能再简单概括成“边界 bug 还没修”。更准确地说：
 
-```
-<元素> GTH-LDA-q<价电子数>
-    <q>
-    <rloc> <n_c> <c1> <c2> ...
-    <n_channels>
-    <l> <rp> <n_proj>
-      <h_11> <h_12> ...
-      <h_22> ...
-    <l> <rp> <n_proj>
-      <h_11> ...
-```
+- adaptive 边界错误的最严重实现 bug 已经修过；
+- Hartree provider 也不再是唯一主要嫌疑；
+- 但 `uniform_exterior` 仍然是实用型近似，不是最终 free-space 精确解；
+- 对于较细 adaptive 参数，当前剩余误差已经更多表现为 near-core / `Eloc` 偏差，而不是单纯“边界条件没开对”。
 
-### 4.4 JAX 特定注意事项
+## 5. H2 验证链条
 
-#### 随机数种子
+仓库里 H2 相关脚本很多，但并不是每一个都应当视为“当前结论脚本”。
 
-```python
-key = jax.random.PRNGKey(seed)  # 设置随机种子保证可复现
-```
+### 5.1 当前最重要的 H2 脚本
 
-#### JIT 编译
+#### `verify_h2.py`
+- uniform H2 vs PySCF 基线曲线
+- 回答：uniform 路线是否稳定、当前 PySCF 对照口径是什么
 
-- 首次运行会有编译开销
-- 后续运行使用缓存的编译结果
-- 大量小计算可能JIT开销占主导
+#### `verify_h2_adaptive_vs_pyscf.py`
+- adaptive H2 vs PySCF 近平衡小范围曲线
+- 当前最直接的 adaptive 曲线入口
+- 回答：adaptive 在 `R=1.2,1.4,1.6` 这类小范围上误差量级如何
 
-#### 内存使用
+#### `check_h2_r14_energy_breakdown.py`
+- `R=1.4` 单点总能分解
+- 回答：`Ts / Eloc / Enl / Eh / Exc / Eion` 中谁在拉偏 adaptive 总能
 
-- 网格大小直接影响内存需求
-- 对于 N 个网格点，哈密顿矩阵需要 O(N²) 内存
-- 示例: N=20,000 时，稠密矩阵约 1.6 GB (float32)
+#### `check_h2_r14_local_energy_profile.py`
+- `R=1.4` 的 `e_loc(r)=rho(r)V_loc(r)` 空间分解与密度 profile
+- 回答：`dEloc` 主要来自 near-core、bond region 还是 outer region
 
-### 4.5 常见问题和解决
+### 5.2 仍保留但不应直接当作主结论的脚本
 
-| 问题 | 可能原因 | 解决方案 |
-|------|---------|---------|
-| SCF 不收敛 | mix_alpha 太大 | 减小到 0.2-0.3 |
-| 能量为 NaN | 盒子太小/网格太稀 | 增大 box_size，减小 spacing |
-| 与参考值偏差大 | XC 泛函不匹配 | 确认使用 LDA-PZ81 |
-| 非局域势报错 | h 矩阵格式错误 | 检查赝势文件格式 |
-| 计算太慢 | 网格太密 | 适当增大 spacing |
+`study_h2_*` 这组脚本覆盖过：
+- boundary follow-up
+- frozen Veff
+- state matching
+- solver parity
+- branch switching
+- local-field consistency
+- kinetic prototype
 
----
+它们在开发过程中非常有用，但当前 main 的 README / 方法文档不应把这些阶段性工具逐条升级成“最终结论”。
 
-## 附录: 核心算法公式汇总
+## 6. 当前最可信的数值结论
 
-### 交换相关能 (LDA-PZ81)
+## 6.1 单点结论（较可信）
 
-**交换能密度**:
-```
-ε_x = -3/4 · (3/π)^(1/3) · ρ^(4/3)
-```
+在当前 main、并且已经统一关键验证脚本随机初始条件口径之后：
 
-**相关能密度**:
-```
-高密度 (r_s < 1):
-  ε_c = A·ln(r_s) + B + C·r_s·ln(r_s) + D·r_s
+- `R = 1.4 Bohr`
+- `box = 30`
+- `h_min = 0.16`
+- `h_max = 0.32`
+- `r_core = 1.0`
+- `stretch_beta = 5.0`
+- `hartree_boundary_mode = uniform_exterior`
+- `kinetic_mode = prototype_fd2`
+- `max_iter = 120`
+- `tolerance = 1e-5`
 
-低密度 (r_s ≥ 1):
-  ε_c = γ / (1 + β₁√r_s + β₂·r_s)
+得到的 adaptive vs PySCF 单点误差大约为：
+- **`-4.9 mHa`**
 
-r_s = (3/(4πρ))^(1/3)
-```
+这是当前最可信、也最值得写入文档的 adaptive 单点结果量级。
 
-### 动能 - 四阶差分
+## 6.2 曲线结论（仍需克制）
 
-```
-Tψ = -1/2 ∇²ψ
+当前可以比较稳地说：
+- adaptive 在近平衡小范围上已经能够给出负总能和合理的最低点区间；
+- 但还不能把整条 H2 曲线说成“完全收敛到 uniform / PySCF”。
 
-∇²ψ ≈ [-2.5·ψ₀ + (4/3)(ψ₊₁ + ψ₋₁) - (1/12)(ψ₊₂ + ψ₋₂)] / h²
-```
+因此：
+- **单点结论比整条曲线结论更可信**；
+- README 与本文档都不应把单点进展夸大成“adaptive H2 曲线问题已经解决”。
 
-### Hartree 能 (Hockney)
+## 7. 当前主要误差来源理解
 
-```
-V_H(r) = ∫ ρ(r')/|r-r'| dr'
+根据当前 main 上最可信的审计结果：
 
-FFT 域计算:
-  Ṽ_H(k) = ρ̃(k) · 4π/k²
-  V_H(r) = IFFT[Ṽ_H]
-```
+1. `R=1.4` 单点的 adaptive vs uniform 总能差，不是总能公式错误；
+2. 最大的分量差来自 **`Eloc`**；
+3. `Ts` 明显参与，但更像部分补偿项；
+4. `Enl` 很小，不是主矛盾；
+5. `Eloc` 的空间分解进一步显示：
+   - 偏差主要集中在 **near-core 区域**；
+   - outer 区域有明显反向补偿；
+   - 更细参数可以减小这一偏差，但尚未完全消除。
 
----
+因此，当前更合理的表述是：
+- 剩余几 mHa 误差更像是 **near-core resolution / density redistribution** 问题；
+- 而不是 Hartree bookkeeping、`V_loc` 公式本身错误，或简单的总能口径错误。
 
-*文档版本: 1.0*
-*基于 JaxDFT 代码库: RealSpaceDFT-GTH*
+## 8. 当前性能状态
 
+## 8.1 已优化的热路径
 
----
+当前保留在 main 的性能优化主要包括：
+- adaptive SCF 与 adaptive eigensolver 的 `while_loop` 化；
+- adaptive Hartree warm-start；
+- adaptive `uniform_exterior` 缓存；
+- 若干 trace-safe 改造，减少 JAX tracing 时的 Python 热路径开销。
 
-## 5. Uniform Grid and Adaptive Tensor Grid
+## 8.2 当前真正的瓶颈
 
-JaxDFT now has **two numerical routes** for real-space Kohn-Sham DFT.
+即便如此，adaptive 路线当前仍然慢，主要瓶颈仍在：
+- 细网格下的 adaptive SCF 迭代成本；
+- adaptive Hartree / CG 路径；
+- near-core 分辨率提高后带来的网格与算子成本。
 
-### 5.1 Uniform Grid
+需要明确的是：
+- “已经比以前快一些”
+- **不等于**
+- “性能问题已经解决”。
 
-The uniform route uses a standard Cartesian grid with constant spacing:
-- one global spacing
-- tensor-product Cartesian coordinates
-- simple volume element spacing^3
-- FFT-based Poisson treatment in the uniform-grid path
+## 8.3 已被放弃的优化
 
-This route is the cleanest baseline for verification because the numerical structure is simple and directly comparable across box/spacing sweeps.
+最近一个重要教训是：
+- adaptive metric eigensolver 中的 `HX/HR` 复用虽然能省掉一次 `apply_h`，
+- 但它在 H2 单点上引入了可见精度回退，
+- 因而已从当前 main 的主线配置中回退。
 
-### 5.2 Adaptive Tensor Grid
+这也是为什么本文档强调：
+- 当前 main 的“性能优化”只包含仍被保留的部分；
+- 已经被证明会带来精度回退的实验优化，不应再写成当前主线特性。
 
-The adaptive route keeps the tensor-product structure but redistributes each 1D axis independently.
+## 9. 当前默认推荐验证配置
 
-Let
-- x_i be the adaptive x-axis nodes
-- y_j be the adaptive y-axis nodes
-- z_k be the adaptive z-axis nodes
+## 9.1 快速 sanity 配置
 
-Then the 3D coordinates are still
+用途：
+- 确认 adaptive H2 链路能跑通；
+- 看总能是否为负；
+- 看最低点是否落在合理区间；
+- 不追求 mHa 级精度。
 
+建议参数：
+- `R = 1.2, 1.4, 1.6`
+- `box = 30`
+- `h_min = 0.20`
+- `h_max = 0.40`
+- `r_core = 1.0`
+- `stretch_beta = 5.0`
+- `hartree_boundary_mode = uniform_exterior`
+- `kinetic_mode = prototype_fd2`
+- `max_iter = 60`
+- `tolerance = 1e-4`
 
-_(i,j,k) = (x_i, y_j, z_k)
+## 9.2 更可信的 `R=1.4` 单点配置
 
-but the local spacings
+用途：
+- 当前最可信的 adaptive 单点审计配置；
+- 用于 energy budget、local profile 和 adaptive vs PySCF 单点对齐。
 
-- h_x(i) = x_(i+1) - x_i
-- h_y(j) = y_(j+1) - y_j
-- h_z(k) = z_(k+1) - z_k
+建议参数：
+- `R = 1.4`
+- `box = 30`
+- `h_min = 0.16`
+- `h_max = 0.32`
+- `r_core = 1.0`
+- `stretch_beta = 5.0`
+- `hartree_boundary_mode = uniform_exterior`
+- `kinetic_mode = prototype_fd2`
+- `max_iter = 120`
+- `tolerance = 1e-5`
 
-are no longer constant.
+## 10. 后续路线
 
-The adaptive grid is therefore:
-- structured
-- tensor-product
-- nonuniform
-- still compatible with weighted quadrature and separable axis metadata
+当前更值得推进的方向，不是再去重写 README 里已经被推翻的旧解释，而是：
 
-This is why the current implementation is best described as an **Adaptive Tensor Grid**, not an unstructured finite-element mesh.
+1. **继续压 adaptive 性能**
+   - 但保持“先不伤精度”的原则；
+2. **继续定位剩余几 mHa 误差的 near-core 来源**
+   - 尤其是 `Eloc` 与核附近密度分布；
+3. **把单点结论稳步扩展到曲线级验证**
+   - 先近平衡，再逐步扩展扫描范围；
+4. **保持 uniform 基线与 PySCF 对照口径稳定**
+   - 避免把脚本调用差异误判成物理结论。
 
-## 6. CG Solver
-
-For the adaptive Hartree route, the Poisson problem is written as a sparse linear system
-
-A u = M f
-
-for
-
--Laplace(u) = f
-
-on the interior nodes of the adaptive tensor grid, with Dirichlet boundary data entering through the right-hand side.
-
-Conceptually, this is a **CG-solver-compatible SPD system**:
-- A is the sparse adaptive stiffness/operator matrix
-- M is the adaptive mass / control-volume matrix
-- the right-hand side changes with 
-ho, but the operator does not change as long as the grid geometry stays fixed
-
-This is important algorithmically because it means:
-- the adaptive Poisson operator can be assembled once per grid
-- repeated SCF iterations reuse the same sparse geometry-dependent operator
-- the adaptive Hartree path is naturally expressed as a sparse linear solve rather than an FFT convolution on a globally uniform mesh
-
-In other words, the uniform and adaptive routes differ not only in the grid, but also in the **linear algebra used for Poisson**.
-
-## 7. Multipole Boundaries
-
-Because the adaptive Hartree solve is performed on a finite box, the boundary model matters.
-The codebase now supports several finite-box boundary prescriptions:
-
-- zero_dirichlet
-- monopole_dirichlet
-- multipole_dirichlet
-- uniform_exterior
-
-### 7.1 Monopole Boundaries
-
-The monopole boundary model uses the total charge
-
-Q = integral rho(r) dr
-
-and sets boundary values using a charge-center or box-center reference point.
-
-### 7.2 Multipole Boundaries
-
-The multipole boundary model extends the monopole approximation by including low-order moments of the charge distribution. This gives more isolated-like face data than a pure Q/r boundary model and is a better approximation when the box is finite but the density is localized.
-
-### 7.3 Exterior-Assisted Boundaries
-
-uniform_exterior keeps the adaptive interior solve but obtains boundary values from a larger, coarse auxiliary uniform-grid exterior calculation. This provides a practical bridge between:
-- the efficiency of the adaptive interior grid
-- the more free-space-like behavior of a larger exterior domain
-
-So the modern adaptive Hartree stack should be understood as:
-- **Adaptive Tensor Grid** in the interior
-- **sparse / CG-style Poisson solve** on that interior grid
-- **multipole or exterior-assisted boundary data** on the finite box
-
+本文档比 README 更技术，但仍然只记录当前 main 分支的真实实现状态。若与旧实验笔记、旧图、旧注释冲突，请以当前代码、当前脚本默认行为和当前审计结果为准。
