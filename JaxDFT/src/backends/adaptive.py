@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.experimental import sparse as jsparse
+from scipy.sparse.linalg import splu
 
 from .base import ArrayLike, BackendState, NonlocalCache
 from ..grids.adaptive_poisson import (
@@ -33,6 +34,9 @@ from ..hamiltonian import (
 )
 
 
+POISSON_SPLU_AUTO_MAX_UNKNOWNS = 150000
+
+
 @jax.jit
 def apply_nonlocal_weighted(
     psi: ArrayLike,
@@ -47,6 +51,23 @@ def apply_nonlocal_weighted(
     return jnp.sum(weight[:, None, None, None] * p_i, axis=0)
 
 
+@jax.jit
+def apply_nonlocal_weighted_block(
+    psi_block: ArrayLike,
+    p_i: ArrayLike,
+    p_j: ArrayLike,
+    coeffs: ArrayLike,
+    volume_weights: ArrayLike,
+) -> ArrayLike:
+    """Apply the nonlocal operator to a block of adaptive orbitals at once."""
+    overlap = jnp.sum(
+        p_j[..., None] * psi_block[None, ...] * volume_weights[None, ..., None],
+        axis=(1, 2, 3),
+    )
+    weight = coeffs[:, None] * overlap
+    return jnp.sum(weight[:, None, None, None, :] * p_i[..., None], axis=0)
+
+
 class AdaptiveBackend:
     """Thin wrapper over the prototype adaptive tensor-grid numerics."""
 
@@ -58,10 +79,12 @@ class AdaptiveBackend:
         hartree_boundary_mode: str = "multipole_dirichlet",
         hartree_center_mode: str = "box_center",
         kinetic_mode: str = "prototype_fd2",
+        poisson_solver_mode: str = "auto",
     ):
         supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet", "uniform_exterior"}
         supported_center_modes = {"box_center", "charge_center"}
         supported_kinetic_modes = {"prototype_fd2", "symmetric_fv"}
+        supported_poisson_solver_modes = {"auto", "cg", "splu"}
         if hartree_boundary_mode not in supported:
             raise ValueError(
                 f"unsupported hartree_boundary_mode {hartree_boundary_mode!r}; "
@@ -77,9 +100,15 @@ class AdaptiveBackend:
                 f"unsupported kinetic_mode {kinetic_mode!r}; "
                 f"expected one of {sorted(supported_kinetic_modes)}"
             )
+        if poisson_solver_mode not in supported_poisson_solver_modes:
+            raise ValueError(
+                f"unsupported poisson_solver_mode {poisson_solver_mode!r}; "
+                f"expected one of {sorted(supported_poisson_solver_modes)}"
+            )
         self.hartree_boundary_mode = hartree_boundary_mode
         self.hartree_center_mode = hartree_center_mode
         self.kinetic_mode = kinetic_mode
+        self.poisson_solver_mode = poisson_solver_mode
 
     def create_grid(self, spacing: float, box_size: ArrayLike, **kwargs) -> BackendState:
         """Create an adaptive tensor grid using spacing as the minimum spacing."""
@@ -130,10 +159,36 @@ class AdaptiveBackend:
             **kwargs,
         )
         A, M = assemble_poisson_operator_3d(state)
+        n_unknowns = int(A.shape[0])
         state.A_bcoo = jsparse.BCOO.from_scipy_sparse(A)
         state.M_bcoo = jsparse.BCOO.from_scipy_sparse(M)
         state.A_nnz = int(A.nnz)
         state.M_nnz = int(M.nnz)
+        state.poisson_solver_mode = self.poisson_solver_mode
+        state.poisson_solver_resolved = "cg"
+        state.poisson_direct_solver_available = False
+        state.poisson_direct_solver_error = None
+        state.poisson_n_unknowns = n_unknowns
+        state.A_csr = None
+        state.M_csr = None
+        state.A_lu = None
+        can_try_splu = self.poisson_solver_mode in {"auto", "splu"} and n_unknowns <= POISSON_SPLU_AUTO_MAX_UNKNOWNS
+        if can_try_splu:
+            try:
+                A_csr = A.tocsr()
+                M_csr = M.tocsr()
+                state.A_csr = A_csr
+                state.M_csr = M_csr
+                state.A_lu = splu(A_csr.tocsc())
+                state.poisson_direct_solver_available = True
+                state.poisson_solver_resolved = "splu"
+            except Exception as exc:
+                state.A_csr = None
+                state.M_csr = None
+                state.A_lu = None
+                state.poisson_direct_solver_available = False
+                state.poisson_direct_solver_error = f"{type(exc).__name__}: {exc}"
+                state.poisson_solver_resolved = "cg"
         state.x_host = np.asarray(state.x, dtype=np.float64)
         state.y_host = np.asarray(state.y, dtype=np.float64)
         state.z_host = np.asarray(state.z, dtype=np.float64)
@@ -169,6 +224,14 @@ class AdaptiveBackend:
             return -0.5 * state.laplacian_symmetric(psi)
         raise ValueError(f"unsupported kinetic_mode {self.kinetic_mode!r}")
 
+    def apply_kinetic_block(self, state: BackendState, psi_block: ArrayLike) -> ArrayLike:
+        """Apply the selected adaptive kinetic operator to a block of orbitals."""
+        if self.kinetic_mode == "prototype_fd2":
+            return -0.5 * state.laplacian(psi_block)
+        if self.kinetic_mode == "symmetric_fv":
+            return -0.5 * state.laplacian_symmetric(psi_block)
+        raise ValueError(f"unsupported kinetic_mode {self.kinetic_mode!r}")
+
     def solve_hartree(self, state: BackendState, rho: ArrayLike, v_init: ArrayLike | None = None) -> ArrayLike:
         """Solve Hartree with the current adaptive box-Poisson prototype.
 
@@ -183,22 +246,23 @@ class AdaptiveBackend:
         only to the monopole fallback so that the default multipole behavior
         remains unchanged.
         """
+        v_seed = v_init if state.poisson_solver_resolved == "cg" else None
         if self.hartree_boundary_mode == "multipole_dirichlet":
-            V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho, v_init=v_init)
+            V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho, v_init=v_seed)
             return V_h
         if self.hartree_boundary_mode == "monopole_dirichlet":
             V_h, _ = solve_hartree_monopole_dirichlet_3d(
                 state,
                 rho,
                 center_mode=self.hartree_center_mode,
-                v_init=v_init,
+                v_init=v_seed,
             )
             return V_h
         if self.hartree_boundary_mode == "zero_dirichlet":
-            V_h, _ = solve_hartree_dirichlet_3d(state, rho, v_init=v_init)
+            V_h, _ = solve_hartree_dirichlet_3d(state, rho, v_init=v_seed)
             return V_h
         if self.hartree_boundary_mode == "uniform_exterior":
-            V_h, _ = solve_hartree_uniform_exterior_dirichlet_3d(state, rho, v_init=v_init)
+            V_h, _ = solve_hartree_uniform_exterior_dirichlet_3d(state, rho, v_init=v_seed)
             return V_h
         raise ValueError(f"unsupported hartree_boundary_mode {self.hartree_boundary_mode!r}")
 
@@ -222,3 +286,15 @@ class AdaptiveBackend:
             return jnp.zeros_like(psi)
         p_i, p_j, coeffs = cache
         return apply_nonlocal_weighted(psi, p_i, p_j, coeffs, state.volume_weights)
+
+    def apply_nonlocal_block(
+        self,
+        state: BackendState,
+        psi_block: ArrayLike,
+        cache: NonlocalCache,
+    ) -> ArrayLike:
+        """Apply the nonlocal operator to a block of orbitals in one contraction."""
+        if cache is None:
+            return jnp.zeros_like(psi_block)
+        p_i, p_j, coeffs = cache
+        return apply_nonlocal_weighted_block(psi_block, p_i, p_j, coeffs, state.volume_weights)

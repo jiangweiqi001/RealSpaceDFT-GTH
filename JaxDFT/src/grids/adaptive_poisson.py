@@ -925,12 +925,16 @@ def solve_poisson_dirichlet_3d(
             "construct it through AdaptiveBackend.create_grid/create_adaptive_grid"
         )
 
+    solver_mode_requested = getattr(grid, "poisson_solver_mode", "cg")
+    solver_mode_resolved = getattr(grid, "poisson_solver_resolved", "cg")
     A_lu = getattr(grid, "A_lu", None)
     A_csr = getattr(grid, "A_csr", None)
     M_csr = getattr(grid, "M_csr", None)
     boundary_mode = "zero_dirichlet"
+    direct_solver_allowed = solver_mode_requested != "cg" and solver_mode_resolved == "splu"
     use_direct_solver = (
-        A_lu is not None
+        direct_solver_allowed
+        and A_lu is not None
         and A_csr is not None
         and M_csr is not None
         and not _contains_tracer(rhs_arr)
@@ -959,6 +963,8 @@ def solve_poisson_dirichlet_3d(
             "boundary_mode": boundary_mode,
             "boundary_load_norm": jnp.asarray(0.0 if boundary_load_np is None else float(np.linalg.norm(boundary_load_np)), dtype=jnp.float32),
             "cg_info": None,
+            "poisson_solver_mode": solver_mode_requested,
+            "poisson_solver_resolved": solver_mode_resolved,
         }
         return unflatten_interior_3d(grid, u_int_np, boundary_faces=boundary_faces), diagnostics
 
@@ -994,6 +1000,8 @@ def solve_poisson_dirichlet_3d(
         "boundary_mode": boundary_mode,
         "boundary_load_norm": jnp.asarray(0.0, dtype=b.dtype) if boundary_load is None else jnp.linalg.norm(boundary_load),
         "cg_info": info,
+        "poisson_solver_mode": solver_mode_requested,
+        "poisson_solver_resolved": solver_mode_resolved,
     }
     return unflatten_interior_3d(grid, u_int, boundary_faces=boundary_faces), diagnostics
 

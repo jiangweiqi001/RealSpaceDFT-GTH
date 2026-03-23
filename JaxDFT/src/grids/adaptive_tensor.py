@@ -305,8 +305,8 @@ def second_derivative_along_axis_symmetric(
 def laplacian_nonuniform_3d(grid: AdaptiveTensorGrid, field: Array) -> Array:
     """Apply the prototype tensor-product Laplacian on an adaptive grid."""
     field = jnp.asarray(field)
-    if field.shape != grid.shape:
-        raise ValueError(f"field shape {field.shape} does not match grid shape {grid.shape}")
+    if field.shape[:3] != grid.shape:
+        raise ValueError(f"field leading shape {field.shape[:3]} does not match grid shape {grid.shape}")
 
     lap = (
         second_derivative_along_axis(field, grid.x, axis=0)
@@ -314,7 +314,10 @@ def laplacian_nonuniform_3d(grid: AdaptiveTensorGrid, field: Array) -> Array:
         + second_derivative_along_axis(field, grid.z, axis=2)
     )
     if getattr(grid, 'mask', None) is not None:
-        lap = lap * grid.mask
+        mask = jnp.asarray(grid.mask, dtype=lap.dtype)
+        while mask.ndim < lap.ndim:
+            mask = mask[..., None]
+        lap = lap * mask
     return lap
 
 
@@ -327,11 +330,14 @@ def laplacian_nonuniform_symmetric_3d(grid: AdaptiveTensorGrid, field: Array) ->
     adaptive weighted inner product while preserving the current full-grid API.
     """
     field = jnp.asarray(field)
-    if field.shape != grid.shape:
-        raise ValueError(f"field shape {field.shape} does not match grid shape {grid.shape}")
+    if field.shape[:3] != grid.shape:
+        raise ValueError(f"field leading shape {field.shape[:3]} does not match grid shape {grid.shape}")
 
     if getattr(grid, 'mask', None) is not None:
-        field = field * grid.mask
+        mask = jnp.asarray(grid.mask, dtype=field.dtype)
+        while mask.ndim < field.ndim:
+            mask = mask[..., None]
+        field = field * mask
 
     lap = (
         second_derivative_along_axis_symmetric(field, grid.x, grid.wx, axis=0)
@@ -339,7 +345,10 @@ def laplacian_nonuniform_symmetric_3d(grid: AdaptiveTensorGrid, field: Array) ->
         + second_derivative_along_axis_symmetric(field, grid.z, grid.wz, axis=2)
     )
     if getattr(grid, 'mask', None) is not None:
-        lap = lap * grid.mask
+        mask = jnp.asarray(grid.mask, dtype=lap.dtype)
+        while mask.ndim < lap.ndim:
+            mask = mask[..., None]
+        lap = lap * mask
     return lap
 
 

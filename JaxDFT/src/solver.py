@@ -22,7 +22,10 @@ def _dirichlet_project_field(grid, field):
     if mask is None:
         return field
     field = jnp.asarray(field)
-    return field * jnp.asarray(mask, dtype=field.dtype)
+    mask_arr = jnp.asarray(mask, dtype=field.dtype)
+    while mask_arr.ndim < field.ndim:
+        mask_arr = mask_arr[..., None]
+    return field * mask_arr
 
 
 def _dirichlet_project_block(grid, block):
@@ -162,6 +165,7 @@ def solve_orbitals_subspace(
     backend=None,
     trace_sink=None,
     trace_context=None,
+    apply_h_block_fn=None,
 ):
     """
     Iterative eigensolver using block subspace expansion + Rayleigh-Ritz.
@@ -193,10 +197,14 @@ def solve_orbitals_subspace(
     else:
         X = x_init + 1e-6 * jax.random.normal(key, (n_grid, n_bands)).astype(jnp.float32)
 
+    if apply_h_block_fn is None:
+        def apply_h_block_fn(block):
+            return jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(block)
+
     if not metric_enabled:
         # Initial orthonormalization
         X = jnp.linalg.qr(X)[0]
-        HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
+        HX = apply_h_block_fn(X)
 
         def cond_fun(state):
             i, _, _, _, res_norm = state
@@ -227,7 +235,7 @@ def solve_orbitals_subspace(
                 R_ortho = jnp.linalg.qr(R_ortho)[0]
 
                 # 4) Expand subspace
-                HR = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(R_ortho)
+                HR = apply_h_block_fn(R_ortho)
 
                 Z = jnp.concatenate([X, R_ortho], axis=1)
                 HZ = jnp.concatenate([HX, HR], axis=1)
@@ -265,7 +273,7 @@ def solve_orbitals_subspace(
     X = _dirichlet_project_block(grid, X)
     X = _metric_orthonormalize(grid, backend, X, scale)
     X = _dirichlet_project_block(grid, X)
-    HX = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(X)
+    HX = apply_h_block_fn(X)
     HX = _dirichlet_project_block(grid, HX)
 
     if not trace_enabled:
@@ -306,7 +314,7 @@ def solve_orbitals_subspace(
                 Z0 = _dirichlet_project_block(grid, Z0)
                 Z = _metric_orthonormalize(grid, backend, Z0, scale)
                 Z = _dirichlet_project_block(grid, Z)
-                HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
+                HZ = apply_h_block_fn(Z)
                 HZ = _dirichlet_project_block(grid, HZ)
 
                 # 5) Rayleigh-Ritz in expanded metric-orthonormal subspace
@@ -387,7 +395,7 @@ def solve_orbitals_subspace(
         Z0 = _dirichlet_project_block(grid, Z0)
         Z = _metric_orthonormalize(grid, backend, Z0, scale)
         Z = _dirichlet_project_block(grid, Z)
-        HZ = jax.vmap(apply_h_fn, in_axes=1, out_axes=1)(Z)
+        HZ = apply_h_block_fn(Z)
         HZ = _dirichlet_project_block(grid, HZ)
 
         # 5) Rayleigh-Ritz in expanded metric-orthonormal subspace
@@ -576,6 +584,15 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             hpsi = _dirichlet_project_field(grid, hpsi)
             return hpsi.reshape(-1)
 
+        def apply_h_block(block_flat):
+            psi_block = block_flat.reshape(grid.shape + (-1,))
+            psi_block = _dirichlet_project_field(grid, psi_block)
+            kinetic_block = backend.apply_kinetic_block(grid, psi_block)
+            v_nonlocal_block = backend.apply_nonlocal_block(grid, psi_block, proj_data)
+            hpsi_block = kinetic_block + V_eff[..., None] * psi_block + v_nonlocal_block
+            hpsi_block = _dirichlet_project_field(grid, hpsi_block)
+            return hpsi_block.reshape(n_grid, -1)
+
         # Subspace eigensolver with residual-based convergence
         iter_key = jax.random.fold_in(key, i)
         metric_backend = backend if getattr(backend, "name", None) != "uniform" else None
@@ -595,6 +612,7 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             backend=metric_backend,
             trace_sink=orbital_trace,
             trace_context={"scf_iter": int(i)} if trace_enabled else None,
+            apply_h_block_fn=apply_h_block if metric_backend is not None else None,
         )
         
         # 归一化
