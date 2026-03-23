@@ -67,3 +67,76 @@ print(f"总能量: {energy:.6f} Hartree")
 
 ### 2. 盒子大小独立性测试 (`check_box.py`)
 - **结论**: 扫描了从 `L=10.0` 到 `L=36.0` Bohr 的超大盒子。结果显示，只要边界留有足够的衰减空间，体系总能量即保持恒定。这从数值上绝对证明了内核已成功实现 **孤立开边界体系**，规避了传统平面波 (Plane-Wave) 代码面临的周期性镜像排斥问题。
+
+
+---
+
+## Numerical Schemes
+
+JaxDFT now contains **two real-space solution routes**:
+
+### 1. Uniform Grid
+
+The original route uses a **pure uniform Cartesian grid**:
+- fixed spacing in all three directions
+- standard real-space finite-difference kinetic operator
+- FFT-based Hartree / Poisson treatment for the uniform grid path
+- this remains the simplest baseline for verification and regression
+
+This path is still the easiest way to do controlled spacing sweeps and compare against PySCF-style reference curves.
+
+### 2. Adaptive Tensor Grid
+
+The newer route uses an **Adaptive Tensor Grid**:
+- each Cartesian axis is redistributed independently
+- the grid remains tensor-product structured, but spacing is no longer uniform
+- fine spacing is concentrated near nuclei and coarser spacing is used farther away
+- integration, inner products, and nonlocal projector overlaps are all evaluated with adaptive volume weights
+
+This path is intended to reduce unnecessary vacuum cost while keeping a real-space discretization.
+
+## Adaptive Tensor Grid
+
+The adaptive route is not an unstructured mesh. It is a **tensor-product nonuniform grid** built from three 1D adaptive axes:
+- x = create_adaptive_axis(...)
+- y = create_adaptive_axis(...)
+- z = create_adaptive_axis(...)
+
+Key properties:
+- the grid is still logically Cartesian
+- the spacing can vary strongly near the ionic cores
+- the SCF layer still works with a full 3D field representation
+- Dirichlet masking is used on the outer boundary of the adaptive box
+
+In practice, this means JaxDFT currently supports both:
+- a simple, easier-to-interpret **uniform-grid baseline**
+- a more compact but more numerically delicate **adaptive tensor-grid route**
+
+## CG Solver
+
+For the adaptive Poisson problem, JaxDFT assembles a sparse finite-volume-style box operator for
+
+-Laplace(V_H) = 4 pi rho
+
+on the adaptive tensor grid.
+
+Algorithmically, this adaptive Hartree solve is formulated as a sparse linear system and supports a **CG-based solver path** for the box Poisson problem. In addition, implementation-level acceleration may reuse cached sparse operators / factorizations so that repeated SCF Hartree solves do not rebuild the same linear algebra objects every iteration.
+
+The key idea is that the **adaptive Hartree operator is geometry-dependent but density-independent**, so the expensive matrix construction can be cached once per grid.
+
+## Multipole Boundaries
+
+The adaptive Hartree route supports several boundary-data models for the finite box:
+- zero_dirichlet
+- monopole_dirichlet
+- multipole_dirichlet
+- uniform_exterior
+
+multipole_dirichlet is the natural extension of the older monopole fallback: instead of using only the total charge, it uses low-order multipole information to provide more isolated-like boundary values on the six box faces.
+
+uniform_exterior is the current practical adaptive mainline for H2-style studies: the adaptive interior operator is kept, but boundary values are obtained from a larger, coarse auxiliary uniform exterior solve.
+
+So at a high level, the codebase now contains two complementary solution families:
+- **Uniform Grid + FFT Poisson**
+- **Adaptive Tensor Grid + Sparse/CG-style Poisson + Multipole/Exterior boundary models**
+

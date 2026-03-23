@@ -464,3 +464,109 @@ FFT 域计算:
 
 *文档版本: 1.0*
 *基于 JaxDFT 代码库: RealSpaceDFT-GTH*
+
+
+---
+
+## 5. Uniform Grid and Adaptive Tensor Grid
+
+JaxDFT now has **two numerical routes** for real-space Kohn-Sham DFT.
+
+### 5.1 Uniform Grid
+
+The uniform route uses a standard Cartesian grid with constant spacing:
+- one global spacing
+- tensor-product Cartesian coordinates
+- simple volume element spacing^3
+- FFT-based Poisson treatment in the uniform-grid path
+
+This route is the cleanest baseline for verification because the numerical structure is simple and directly comparable across box/spacing sweeps.
+
+### 5.2 Adaptive Tensor Grid
+
+The adaptive route keeps the tensor-product structure but redistributes each 1D axis independently.
+
+Let
+- x_i be the adaptive x-axis nodes
+- y_j be the adaptive y-axis nodes
+- z_k be the adaptive z-axis nodes
+
+Then the 3D coordinates are still
+
+
+_(i,j,k) = (x_i, y_j, z_k)
+
+but the local spacings
+
+- h_x(i) = x_(i+1) - x_i
+- h_y(j) = y_(j+1) - y_j
+- h_z(k) = z_(k+1) - z_k
+
+are no longer constant.
+
+The adaptive grid is therefore:
+- structured
+- tensor-product
+- nonuniform
+- still compatible with weighted quadrature and separable axis metadata
+
+This is why the current implementation is best described as an **Adaptive Tensor Grid**, not an unstructured finite-element mesh.
+
+## 6. CG Solver
+
+For the adaptive Hartree route, the Poisson problem is written as a sparse linear system
+
+A u = M f
+
+for
+
+-Laplace(u) = f
+
+on the interior nodes of the adaptive tensor grid, with Dirichlet boundary data entering through the right-hand side.
+
+Conceptually, this is a **CG-solver-compatible SPD system**:
+- A is the sparse adaptive stiffness/operator matrix
+- M is the adaptive mass / control-volume matrix
+- the right-hand side changes with 
+ho, but the operator does not change as long as the grid geometry stays fixed
+
+This is important algorithmically because it means:
+- the adaptive Poisson operator can be assembled once per grid
+- repeated SCF iterations reuse the same sparse geometry-dependent operator
+- the adaptive Hartree path is naturally expressed as a sparse linear solve rather than an FFT convolution on a globally uniform mesh
+
+In other words, the uniform and adaptive routes differ not only in the grid, but also in the **linear algebra used for Poisson**.
+
+## 7. Multipole Boundaries
+
+Because the adaptive Hartree solve is performed on a finite box, the boundary model matters.
+The codebase now supports several finite-box boundary prescriptions:
+
+- zero_dirichlet
+- monopole_dirichlet
+- multipole_dirichlet
+- uniform_exterior
+
+### 7.1 Monopole Boundaries
+
+The monopole boundary model uses the total charge
+
+Q = integral rho(r) dr
+
+and sets boundary values using a charge-center or box-center reference point.
+
+### 7.2 Multipole Boundaries
+
+The multipole boundary model extends the monopole approximation by including low-order moments of the charge distribution. This gives more isolated-like face data than a pure Q/r boundary model and is a better approximation when the box is finite but the density is localized.
+
+### 7.3 Exterior-Assisted Boundaries
+
+uniform_exterior keeps the adaptive interior solve but obtains boundary values from a larger, coarse auxiliary uniform-grid exterior calculation. This provides a practical bridge between:
+- the efficiency of the adaptive interior grid
+- the more free-space-like behavior of a larger exterior domain
+
+So the modern adaptive Hartree stack should be understood as:
+- **Adaptive Tensor Grid** in the interior
+- **sparse / CG-style Poisson solve** on that interior grid
+- **multipole or exterior-assisted boundary data** on the finite box
+
