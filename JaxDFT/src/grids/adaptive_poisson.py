@@ -972,16 +972,30 @@ def solve_poisson_dirichlet_3d(
     def apply_A(x):
         return A_bcoo @ x
 
+    inv_diag = getattr(grid, "A_inv_diag", None)
+
+    def apply_M(x):
+        if inv_diag is None:
+            return x
+        return jnp.asarray(inv_diag, dtype=x.dtype) * x
+
     x0 = None
     if u_init is not None:
         x0 = flatten_interior_3d(jnp.asarray(u_init, dtype=b.dtype))
 
-    u_int, info = jax_cg.cg(apply_A, b, x0=x0, maxiter=800, tol=1e-6)
-    for _ in range(3):
-        correction, _ = jax_cg.cg(apply_A, -(apply_A(u_int) - b), maxiter=800, tol=1e-6)
-        u_int = u_int + correction
+    u_int, info = jax_cg.cg(apply_A, b, x0=x0, maxiter=600, tol=1e-6, M=apply_M)
     residual = apply_A(u_int) - b
     rhs_norm = jnp.linalg.norm(b)
+    residual_norm = jnp.linalg.norm(residual)
+    refine_threshold = jnp.maximum(rhs_norm, jnp.asarray(1.0, dtype=rhs_norm.dtype)) * jnp.asarray(5.0e-6, dtype=rhs_norm.dtype)
+
+    def refine_solution(u_curr):
+        res_curr = apply_A(u_curr) - b
+        correction, _ = jax_cg.cg(apply_A, -res_curr, maxiter=250, tol=1e-6, M=apply_M)
+        return u_curr + correction
+
+    u_int = jax.lax.cond(residual_norm > refine_threshold, refine_solution, lambda u: u, u_int)
+    residual = apply_A(u_int) - b
     residual_norm = jnp.linalg.norm(residual)
     rel_res = residual_norm / jnp.maximum(rhs_norm, jnp.asarray(1.0e-30, dtype=rhs_norm.dtype))
 
@@ -994,6 +1008,7 @@ def solve_poisson_dirichlet_3d(
         "boundary_mode": boundary_mode,
         "boundary_load_norm": jnp.asarray(0.0, dtype=b.dtype) if boundary_load is None else jnp.linalg.norm(boundary_load),
         "cg_info": info,
+        "preconditioner": "jacobi" if inv_diag is not None else "none",
     }
     return unflatten_interior_3d(grid, u_int, boundary_faces=boundary_faces), diagnostics
 
