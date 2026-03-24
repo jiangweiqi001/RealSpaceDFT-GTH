@@ -58,6 +58,9 @@ class AdaptiveBackend:
         hartree_boundary_mode: str = "multipole_dirichlet",
         hartree_center_mode: str = "box_center",
         kinetic_mode: str = "prototype_fd2",
+        cg_maxiter: int = 800,
+        cg_tol: float = 1.0e-6,
+        residual_correction_steps: int = 1,
     ):
         supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet", "uniform_exterior"}
         supported_center_modes = {"box_center", "charge_center"}
@@ -77,9 +80,14 @@ class AdaptiveBackend:
                 f"unsupported kinetic_mode {kinetic_mode!r}; "
                 f"expected one of {sorted(supported_kinetic_modes)}"
             )
+        if residual_correction_steps < 0:
+            raise ValueError("residual_correction_steps must be nonnegative")
         self.hartree_boundary_mode = hartree_boundary_mode
         self.hartree_center_mode = hartree_center_mode
         self.kinetic_mode = kinetic_mode
+        self.cg_maxiter = int(cg_maxiter)
+        self.cg_tol = float(cg_tol)
+        self.residual_correction_steps = int(residual_correction_steps)
 
     def create_grid(self, spacing: float, box_size: ArrayLike, **kwargs) -> BackendState:
         """Create an adaptive tensor grid using spacing as the minimum spacing."""
@@ -184,7 +192,14 @@ class AdaptiveBackend:
         remains unchanged.
         """
         if self.hartree_boundary_mode == "multipole_dirichlet":
-            V_h, _ = solve_hartree_multipole_dirichlet_3d(state, rho, v_init=v_init)
+            V_h, _ = solve_hartree_multipole_dirichlet_3d(
+                state,
+                rho,
+                v_init=v_init,
+                cg_maxiter=self.cg_maxiter,
+                cg_tol=self.cg_tol,
+                residual_correction_steps=self.residual_correction_steps,
+            )
             return V_h
         if self.hartree_boundary_mode == "monopole_dirichlet":
             V_h, _ = solve_hartree_monopole_dirichlet_3d(
@@ -192,13 +207,30 @@ class AdaptiveBackend:
                 rho,
                 center_mode=self.hartree_center_mode,
                 v_init=v_init,
+                cg_maxiter=self.cg_maxiter,
+                cg_tol=self.cg_tol,
+                residual_correction_steps=self.residual_correction_steps,
             )
             return V_h
         if self.hartree_boundary_mode == "zero_dirichlet":
-            V_h, _ = solve_hartree_dirichlet_3d(state, rho, v_init=v_init)
+            V_h, _ = solve_hartree_dirichlet_3d(
+                state,
+                rho,
+                v_init=v_init,
+                cg_maxiter=self.cg_maxiter,
+                cg_tol=self.cg_tol,
+                residual_correction_steps=self.residual_correction_steps,
+            )
             return V_h
         if self.hartree_boundary_mode == "uniform_exterior":
-            V_h, _ = solve_hartree_uniform_exterior_dirichlet_3d(state, rho, v_init=v_init)
+            V_h, _ = solve_hartree_uniform_exterior_dirichlet_3d(
+                state,
+                rho,
+                v_init=v_init,
+                cg_maxiter=self.cg_maxiter,
+                cg_tol=self.cg_tol,
+                residual_correction_steps=self.residual_correction_steps,
+            )
             return V_h
         raise ValueError(f"unsupported hartree_boundary_mode {self.hartree_boundary_mode!r}")
 

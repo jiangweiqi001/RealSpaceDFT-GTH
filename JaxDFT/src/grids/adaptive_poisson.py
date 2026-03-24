@@ -884,6 +884,9 @@ def solve_hartree_uniform_exterior_dirichlet_3d(
     padding: float = 8.0,
     dx_ext: float = 0.8,
     v_init: Array | None = None,
+    cg_maxiter: int = 800,
+    cg_tol: float = 1.0e-6,
+    residual_correction_steps: int = 1,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve the prototype Hartree problem using an auxiliary uniform exterior boundary provider."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
@@ -893,7 +896,15 @@ def solve_hartree_uniform_exterior_dirichlet_3d(
         padding=padding,
         dx_ext=dx_ext,
     )
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces, u_init=v_init)
+    V, diagnostics = solve_poisson_dirichlet_3d(
+        grid,
+        rhs,
+        boundary_faces=faces,
+        u_init=v_init,
+        cg_maxiter=cg_maxiter,
+        cg_tol=cg_tol,
+        residual_correction_steps=residual_correction_steps,
+    )
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     diagnostics.update(face_diagnostics)
@@ -905,6 +916,10 @@ def solve_poisson_dirichlet_3d(
     rhs: Array,
     boundary_faces: dict[str, Array] | None = None,
     u_init: Array | None = None,
+    *,
+    cg_maxiter: int = 800,
+    cg_tol: float = 1.0e-6,
+    residual_correction_steps: int = 1,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve -Laplace(u) = rhs on an adaptive tensor grid with Dirichlet boundaries.
 
@@ -916,6 +931,12 @@ def solve_poisson_dirichlet_3d(
     expected_shape = tuple(int(n) for n in grid.shape)
     if rhs_arr.shape != expected_shape:
         raise ValueError(f"rhs shape {rhs_arr.shape} does not match grid shape {expected_shape}")
+
+    cg_maxiter = int(cg_maxiter)
+    cg_tol = float(cg_tol)
+    residual_correction_steps = int(residual_correction_steps)
+    if residual_correction_steps < 0:
+        raise ValueError("residual_correction_steps must be nonnegative")
 
     A_bcoo = getattr(grid, "A_bcoo", None)
     M_bcoo = getattr(grid, "M_bcoo", None)
@@ -952,6 +973,7 @@ def solve_poisson_dirichlet_3d(
         rel_res = residual_norm / max(rhs_norm, 1.0e-30)
         diagnostics = {
             "method": "scipy_splu",
+            "solver_path": "scipy_splu",
             "n_unknowns": int(u_int_np.size),
             "nnz": int(getattr(grid, "A_nnz", A_csr.nnz)),
             "residual_norm": jnp.asarray(residual_norm, dtype=jnp.float32),
@@ -959,6 +981,10 @@ def solve_poisson_dirichlet_3d(
             "boundary_mode": boundary_mode,
             "boundary_load_norm": jnp.asarray(0.0 if boundary_load_np is None else float(np.linalg.norm(boundary_load_np)), dtype=jnp.float32),
             "cg_info": None,
+            "cg_maxiter": cg_maxiter,
+            "cg_tol": cg_tol,
+            "residual_correction_steps": residual_correction_steps,
+            "correction_applied": 0,
         }
         return unflatten_interior_3d(grid, u_int_np, boundary_faces=boundary_faces), diagnostics
 
@@ -976,10 +1002,12 @@ def solve_poisson_dirichlet_3d(
     if u_init is not None:
         x0 = flatten_interior_3d(jnp.asarray(u_init, dtype=b.dtype))
 
-    u_int, info = jax_cg.cg(apply_A, b, x0=x0, maxiter=800, tol=1e-6)
-    for _ in range(3):
-        correction, _ = jax_cg.cg(apply_A, -(apply_A(u_int) - b), maxiter=800, tol=1e-6)
+    correction_applied = 0
+    u_int, info = jax_cg.cg(apply_A, b, x0=x0, maxiter=cg_maxiter, tol=cg_tol)
+    for _ in range(residual_correction_steps):
+        correction, _ = jax_cg.cg(apply_A, -(apply_A(u_int) - b), maxiter=cg_maxiter, tol=cg_tol)
         u_int = u_int + correction
+        correction_applied += 1
     residual = apply_A(u_int) - b
     rhs_norm = jnp.linalg.norm(b)
     residual_norm = jnp.linalg.norm(residual)
@@ -987,6 +1015,7 @@ def solve_poisson_dirichlet_3d(
 
     diagnostics = {
         "method": "jax_cg",
+        "solver_path": "jax_cg",
         "n_unknowns": int(u_int.size),
         "nnz": int(getattr(grid, "A_nnz", A_bcoo.nse)),
         "residual_norm": residual_norm,
@@ -994,14 +1023,33 @@ def solve_poisson_dirichlet_3d(
         "boundary_mode": boundary_mode,
         "boundary_load_norm": jnp.asarray(0.0, dtype=b.dtype) if boundary_load is None else jnp.linalg.norm(boundary_load),
         "cg_info": info,
+        "cg_maxiter": cg_maxiter,
+        "cg_tol": cg_tol,
+        "residual_correction_steps": residual_correction_steps,
+        "correction_applied": correction_applied,
     }
     return unflatten_interior_3d(grid, u_int, boundary_faces=boundary_faces), diagnostics
 
 
-def solve_hartree_dirichlet_3d(grid, rho: Array, *, v_init: Array | None = None) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
+def solve_hartree_dirichlet_3d(
+    grid,
+    rho: Array,
+    *,
+    v_init: Array | None = None,
+    cg_maxiter: int = 800,
+    cg_tol: float = 1.0e-6,
+    residual_correction_steps: int = 1,
+) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve the prototype Hartree problem -Laplace(V_H) = 4*pi*rho."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, u_init=v_init)
+    V, diagnostics = solve_poisson_dirichlet_3d(
+        grid,
+        rhs,
+        u_init=v_init,
+        cg_maxiter=cg_maxiter,
+        cg_tol=cg_tol,
+        residual_correction_steps=residual_correction_steps,
+    )
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     return V, diagnostics
@@ -1015,6 +1063,9 @@ def solve_hartree_multipole_dirichlet_3d(
     center_mode: str = "box_center",
     min_radius: float = 1.0e-8,
     v_init: Array | None = None,
+    cg_maxiter: int = 800,
+    cg_tol: float = 1.0e-6,
+    residual_correction_steps: int = 1,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Solve the prototype Hartree problem using multipole Dirichlet boundary data."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
@@ -1025,7 +1076,15 @@ def solve_hartree_multipole_dirichlet_3d(
         center_mode=center_mode,
         min_radius=min_radius,
     )
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces, u_init=v_init)
+    V, diagnostics = solve_poisson_dirichlet_3d(
+        grid,
+        rhs,
+        boundary_faces=faces,
+        u_init=v_init,
+        cg_maxiter=cg_maxiter,
+        cg_tol=cg_tol,
+        residual_correction_steps=residual_correction_steps,
+    )
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     diagnostics.update(face_diagnostics)
@@ -1040,6 +1099,9 @@ def solve_hartree_monopole_dirichlet_3d(
     center_mode: str = "box_center",
     min_radius: float = 1.0e-8,
     v_init: Array | None = None,
+    cg_maxiter: int = 800,
+    cg_tol: float = 1.0e-6,
+    residual_correction_steps: int = 1,
 ) -> tuple[jnp.ndarray, dict[str, Array | int | str]]:
     """Backward-compatible monopole Hartree wrapper retained for regression."""
     rhs = (4.0 * jnp.pi) * jnp.asarray(rho)
@@ -1050,7 +1112,15 @@ def solve_hartree_monopole_dirichlet_3d(
         center_mode=center_mode,
         min_radius=min_radius,
     )
-    V, diagnostics = solve_poisson_dirichlet_3d(grid, rhs, boundary_faces=faces, u_init=v_init)
+    V, diagnostics = solve_poisson_dirichlet_3d(
+        grid,
+        rhs,
+        boundary_faces=faces,
+        u_init=v_init,
+        cg_maxiter=cg_maxiter,
+        cg_tol=cg_tol,
+        residual_correction_steps=residual_correction_steps,
+    )
     diagnostics = dict(diagnostics)
     diagnostics["equation"] = "-Laplace(V_H) = 4*pi*rho"
     diagnostics.update(face_diagnostics)
