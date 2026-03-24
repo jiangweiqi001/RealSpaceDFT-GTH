@@ -435,6 +435,78 @@ def _resolve_backend(backend):
     return UniformBackend() if backend is None else backend
 
 
+def _resolve_adaptive_eigensolver_schedule(
+    backend,
+    adaptive_scf_aware_eigensolver=None,
+    adaptive_eigensolver_early_max_iter=None,
+    adaptive_eigensolver_late_max_iter=None,
+    adaptive_eigensolver_stage_residual_threshold=None,
+    adaptive_eigensolver_late_tol=None,
+):
+    backend_name = getattr(backend, "name", None)
+    legacy_max_iter = 8 if backend_name == "adaptive_tensor" else 30
+    legacy_tol = 1.0e-4 if backend_name == "adaptive_tensor" else 1.0e-5
+    if backend_name != "adaptive_tensor":
+        return {
+            "enabled": False,
+            "legacy_max_iter": legacy_max_iter,
+            "legacy_tol": legacy_tol,
+            "early_max_iter": None,
+            "late_max_iter": None,
+            "stage_threshold": None,
+            "late_tol": None,
+        }
+    enabled = getattr(backend, "adaptive_scf_aware_eigensolver", False)
+    if adaptive_scf_aware_eigensolver is not None:
+        enabled = bool(adaptive_scf_aware_eigensolver)
+    early_max_iter = getattr(backend, "adaptive_eigensolver_early_max_iter", 4)
+    if adaptive_eigensolver_early_max_iter is not None:
+        early_max_iter = adaptive_eigensolver_early_max_iter
+    late_max_iter = getattr(backend, "adaptive_eigensolver_late_max_iter", 12)
+    if adaptive_eigensolver_late_max_iter is not None:
+        late_max_iter = adaptive_eigensolver_late_max_iter
+    stage_threshold = getattr(backend, "adaptive_eigensolver_stage_residual_threshold", 1.0e-3)
+    if adaptive_eigensolver_stage_residual_threshold is not None:
+        stage_threshold = adaptive_eigensolver_stage_residual_threshold
+    late_tol = getattr(backend, "adaptive_eigensolver_late_tol", 1.0e-5)
+    if adaptive_eigensolver_late_tol is not None:
+        late_tol = adaptive_eigensolver_late_tol
+    return {
+        "enabled": bool(enabled),
+        "legacy_max_iter": int(legacy_max_iter),
+        "legacy_tol": float(legacy_tol),
+        "early_max_iter": int(early_max_iter),
+        "late_max_iter": int(late_max_iter),
+        "stage_threshold": float(stage_threshold),
+        "late_tol": float(late_tol),
+    }
+
+
+def _choose_eigensolver_budget(schedule, density_residual_metric):
+    if not schedule["enabled"]:
+        return "fixed", schedule["legacy_max_iter"], schedule["legacy_tol"]
+    residual_value = float(density_residual_metric)
+    if not np.isfinite(residual_value) or residual_value > schedule["stage_threshold"]:
+        return "early", schedule["early_max_iter"], schedule["legacy_tol"]
+    return "late", schedule["late_max_iter"], schedule["late_tol"]
+
+
+def _summarize_orbital_trace(orbital_trace, n_bands):
+    if not orbital_trace:
+        return None
+    iterations = sum(1 for event in orbital_trace if event.get("stage") == "rayleigh_ritz")
+    hpsi_calls = int(n_bands)
+    for event in orbital_trace:
+        if event.get("stage") == "expanded_update":
+            hpsi_calls += int(event.get("subspace_dim", 0))
+    return {
+        "iterations": int(iterations),
+        "final_residual": float(orbital_trace[-1].get("max_residual_norm", np.nan)),
+        "final_subspace_dim": int(orbital_trace[-1].get("subspace_dim", n_bands)),
+        "hpsi_calls": int(hpsi_calls),
+    }
+
+
 def precompute_poisson_kernel(grid_shape, spacing):
     """Backward-compatible wrapper for the current uniform Poisson kernel."""
     return precompute_uniform_poisson_kernel(grid_shape, spacing)
@@ -506,32 +578,45 @@ def anderson_mixing(rho, rho_new, f_hist, mix_alpha, iter_idx, m=5):
     return jax.lax.cond(iter_idx == 0, first, later, operand=None)
 
 
-def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key, backend=None, trace_sink=None, trace_mode="off"):
-    """Run the self-consistent field (SCF) loop.
-
-    Args:
-        grid: Grid object with coordinates, spacing, and volume element.
-        coords: Ion coordinates, shape (n_atoms, 3), in Bohr.
-        n_bands: Number of Kohn-Sham orbitals to solve for.
-        occ: Band occupations (0–2).
-        V_loc: Local ionic potential on the grid, in Hartree.
-        projectors: Nonlocal projector data structure.
-        max_iter: Maximum SCF iterations.
-        mix_alpha: Anderson mixing strength.
-        tolerance: Convergence threshold for density change.
-        key: Base JAX PRNG key used to seed orbital initialization.
-
-    Returns:
-        Tuple (rho, eigvals, eigvecs, V_H, eps_xc, v_xc) where energies are in
-        Hartree and densities in Bohr^-3.
-    """
+def scf(
+    grid,
+    coords,
+    n_bands,
+    occ,
+    V_loc,
+    projectors,
+    max_iter,
+    mix_alpha,
+    tolerance,
+    key,
+    backend=None,
+    trace_sink=None,
+    trace_mode="off",
+    *,
+    return_diagnostics=False,
+    adaptive_scf_aware_eigensolver=None,
+    adaptive_eigensolver_early_max_iter=None,
+    adaptive_eigensolver_late_max_iter=None,
+    adaptive_eigensolver_stage_residual_threshold=None,
+    adaptive_eigensolver_late_tol=None,
+):
+    """Run the self-consistent field (SCF) loop."""
     backend = _resolve_backend(backend)
     coords = jnp.asarray(coords, dtype=jnp.float32)
     if key is None:
         key = jax.random.PRNGKey(42)
     trace_enabled = trace_sink is not None and trace_mode != "off" and getattr(backend, "name", None) != "uniform"
-    
-    # 初始密度
+    diagnostics_enabled = bool(return_diagnostics)
+    schedule = _resolve_adaptive_eigensolver_schedule(
+        backend,
+        adaptive_scf_aware_eigensolver=adaptive_scf_aware_eigensolver,
+        adaptive_eigensolver_early_max_iter=adaptive_eigensolver_early_max_iter,
+        adaptive_eigensolver_late_max_iter=adaptive_eigensolver_late_max_iter,
+        adaptive_eigensolver_stage_residual_threshold=adaptive_eigensolver_stage_residual_threshold,
+        adaptive_eigensolver_late_tol=adaptive_eigensolver_late_tol,
+    )
+    python_control_flow = trace_enabled or diagnostics_enabled or schedule["enabled"]
+
     rho = jnp.zeros(grid.shape, dtype=jnp.float32)
     for a in range(coords.shape[0]):
         r = jnp.linalg.norm(grid.coords - coords[a], axis=-1)
@@ -542,7 +627,6 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     f_hist = jnp.zeros((5, rho.size), dtype=jnp.float32)
     n_grid = rho.size
     proj_data = backend.precompute_nonlocal(grid, coords, projectors)
-    # 占位符
     eigvals0 = jnp.zeros((n_bands,), dtype=jnp.float32)
     eigvecs0 = jnp.zeros((n_grid, n_bands), dtype=jnp.float32)
     V_H0 = jnp.zeros(grid.shape, dtype=jnp.float32)
@@ -551,18 +635,22 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     diff0 = jnp.array(jnp.inf, dtype=jnp.float32)
     i0 = jnp.array(0, dtype=jnp.int32)
 
+    scf_history = [] if diagnostics_enabled else None
+    stage_counts = {"fixed": 0, "early": 0, "late": 0}
+    eigensolver_total_inner_iterations = 0
+    eigensolver_total_hpsi_calls = 0
+
     def cond(state):
         i, _, _, diff, _, _, _, _, _ = state
         return jnp.logical_and(i < max_iter, diff > tolerance)
 
     def body(state):
-        i, rho_cur, f_hist_cur, diff, _, eigvecs0, V_H_prev, _, _ = state
+        nonlocal eigensolver_total_inner_iterations, eigensolver_total_hpsi_calls
+        i, rho_cur, f_hist_cur, diff, _, eigvecs_prev, V_H_prev, _, _ = state
         rho_cur = jnp.clip(rho_cur, 1e-12, None)
         rho_cur = _dirichlet_project_field(grid, rho_cur)
-        
-
+        stage_name, orbital_max_iter, orbital_tol = _choose_eigensolver_budget(schedule, diff)
         V_H = backend.solve_hartree(grid, rho_cur, v_init=V_H_prev)
-        
         eps_xc, v_xc = lda_xc(rho_cur)
         V_eff = V_loc + V_H + v_xc
 
@@ -571,79 +659,118 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
             psi = _dirichlet_project_field(grid, psi)
             kinetic_psi = backend.apply_kinetic(grid, psi)
             v_nonlocal = backend.apply_nonlocal(grid, psi, proj_data)
-
-            hpsi = kinetic_psi + V_eff * psi + v_nonlocal # ?????????
+            hpsi = kinetic_psi + V_eff * psi + v_nonlocal
             hpsi = _dirichlet_project_field(grid, hpsi)
             return hpsi.reshape(-1)
 
-        # Subspace eigensolver with residual-based convergence
         iter_key = jax.random.fold_in(key, i)
         metric_backend = backend if getattr(backend, "name", None) != "uniform" else None
         metric_grid = grid if metric_backend is not None else None
-        orbital_max_iter = 30 if metric_backend is None else 8
-        orbital_tol = 1e-5 if metric_backend is None else 1e-4
-        orbital_trace = [] if trace_enabled else None
+        orbital_trace = [] if metric_backend is not None and (trace_enabled or diagnostics_enabled) else None
         eigvals, eigvecs = solve_orbitals_subspace(
             apply_h,
             n_grid,
             n_bands,
-            x_init=eigvecs0,
+            x_init=eigvecs_prev,
             max_iter=orbital_max_iter,
             tol=orbital_tol,
             key=iter_key,
             grid=metric_grid,
             backend=metric_backend,
             trace_sink=orbital_trace,
-            trace_context={"scf_iter": int(i)} if trace_enabled else None,
+            trace_context={"scf_iter": int(i)} if orbital_trace is not None else None,
         )
-        
-        # 归一化
+        orbital_diag = _summarize_orbital_trace(orbital_trace, n_bands)
+
         eigvecs = _dirichlet_project_block(grid, eigvecs)
         eigvec_fields = jnp.moveaxis(eigvecs.reshape(grid.shape + (n_bands,)), -1, 0)
         norm = jnp.sqrt(jax.vmap(lambda psi: backend.inner_product(grid, psi, psi))(eigvec_fields))
         eigvecs = eigvecs / norm[None, :]
         eigvecs = _dirichlet_project_block(grid, eigvecs)
-        
+
         rho_new = jnp.sum((eigvecs ** 2) * occ[None, :], axis=1).reshape(grid.shape)
         rho_new = _dirichlet_project_field(grid, rho_new)
         diff = jnp.max(jnp.abs(rho_new - rho_cur))
-        
-        rho_flat, f_hist_cur = anderson_mixing(
-            rho_cur.reshape(-1), rho_new.reshape(-1), f_hist_cur, mix_alpha, i
-        )
+        rho_flat, f_hist_cur = anderson_mixing(rho_cur.reshape(-1), rho_new.reshape(-1), f_hist_cur, mix_alpha, i)
         rho_mixed = _dirichlet_project_field(grid, rho_flat.reshape(grid.shape))
+
+        if diagnostics_enabled:
+            stage_counts[stage_name] = stage_counts.get(stage_name, 0) + 1
+            eig_inner_iters = None if orbital_diag is None else int(orbital_diag["iterations"])
+            eig_final_residual = None if orbital_diag is None else float(orbital_diag["final_residual"])
+            eig_hpsi_calls = None if orbital_diag is None else int(orbital_diag["hpsi_calls"])
+            if orbital_diag is not None:
+                eigensolver_total_inner_iterations += eig_inner_iters
+                eigensolver_total_hpsi_calls += eig_hpsi_calls
+            scf_history.append({
+                "iter": int(i),
+                "density_residual": float(diff),
+                "converged_flag": bool(float(diff) <= tolerance),
+                "eigensolver_stage": stage_name,
+                "eigensolver_max_iter_budget": int(orbital_max_iter),
+                "eigensolver_tol": float(orbital_tol),
+                "eigensolver_inner_iterations": eig_inner_iters,
+                "eigensolver_final_residual": eig_final_residual,
+                "eigensolver_hpsi_calls": eig_hpsi_calls,
+            })
+
         if trace_enabled:
-            _maybe_trace_append(
-                trace_sink,
-                {
-                    "scf_iter": int(i),
-                    "x_init": _trace_array(eigvecs0),
-                    "x_init_norm": float(jnp.linalg.norm(eigvecs0)),
-                    "eigvals": _trace_array(eigvals[: min(4, eigvals.shape[0])]),
-                    "eigvecs": _trace_array(eigvecs),
-                    "state0_overlap_prev": _state0_overlap_prev(grid, backend, eigvecs0, eigvecs),
-                    "occupied_subspace_overlap_prev": _occupied_subspace_overlap_prev(grid, backend, eigvecs0, eigvecs, max_m=2),
-                    "rho_in": _trace_array(rho_cur),
-                    "rho_new": _trace_array(rho_new),
-                    "rho_mixed": _trace_array(rho_mixed),
-                    "rho_update_norm": _rms_norm(rho_new - rho_cur),
-                    "rho_mix_step_norm": _rms_norm(rho_mixed - rho_cur),
-                    "rho_new_mixed_diff_norm": _rms_norm(rho_mixed - rho_new),
-                    "orbital_trace": orbital_trace,
-                },
-            )
+            payload = {
+                "scf_iter": int(i),
+                "x_init": _trace_array(eigvecs_prev),
+                "x_init_norm": float(jnp.linalg.norm(eigvecs_prev)),
+                "eigvals": _trace_array(eigvals[: min(4, eigvals.shape[0])]),
+                "eigvecs": _trace_array(eigvecs),
+                "state0_overlap_prev": _state0_overlap_prev(grid, backend, eigvecs_prev, eigvecs),
+                "occupied_subspace_overlap_prev": _occupied_subspace_overlap_prev(grid, backend, eigvecs_prev, eigvecs, max_m=2),
+                "rho_in": _trace_array(rho_cur),
+                "rho_new": _trace_array(rho_new),
+                "rho_mixed": _trace_array(rho_mixed),
+                "rho_update_norm": _rms_norm(rho_new - rho_cur),
+                "rho_mix_step_norm": _rms_norm(rho_mixed - rho_cur),
+                "rho_new_mixed_diff_norm": _rms_norm(rho_mixed - rho_new),
+                "orbital_trace": orbital_trace,
+                "eigensolver_stage": stage_name,
+                "eigensolver_max_iter_budget": int(orbital_max_iter),
+                "eigensolver_tol": float(orbital_tol),
+            }
+            if orbital_diag is not None:
+                payload["eigensolver_inner_iterations"] = int(orbital_diag["iterations"])
+                payload["eigensolver_final_residual"] = float(orbital_diag["final_residual"])
+                payload["eigensolver_hpsi_calls"] = int(orbital_diag["hpsi_calls"])
+            _maybe_trace_append(trace_sink, payload)
         return i + 1, rho_mixed, f_hist_cur, diff, eigvals, eigvecs, V_H, eps_xc, v_xc
 
     state0 = (i0, rho, f_hist, diff0, eigvals0, eigvecs0, V_H0, eps_xc0, v_xc0)
-    if trace_enabled:
+    if python_control_flow:
         final_state = state0
         while bool(cond(final_state)):
             final_state = body(final_state)
     else:
         final_state = jax.lax.while_loop(cond, body, state0)
         final_state = jax.lax.stop_gradient(final_state)
-    _, rho, _, diff, eigvals, eigvecs, V_H, eps_xc, v_xc = final_state
-    
+    i_final, rho, _, diff, eigvals, eigvecs, V_H, eps_xc, v_xc = final_state
+    if diagnostics_enabled:
+        diagnostics = {
+            "result": {
+                "final_iterations": int(i_final),
+                "final_density_residual": float(diff),
+                "converged": bool(float(diff) <= tolerance),
+            },
+            "scf_history": scf_history,
+            "eigensolver_diagnostics": {
+                "scheduler_enabled": bool(schedule["enabled"]),
+                "density_residual_metric": "max_abs_rho_new_minus_rho_in",
+                "stage_switch_threshold": float(schedule["stage_threshold"]) if schedule["enabled"] else None,
+                "early_max_iter": None if not schedule["enabled"] else int(schedule["early_max_iter"]),
+                "late_max_iter": None if not schedule["enabled"] else int(schedule["late_max_iter"]),
+                "late_tol": None if not schedule["enabled"] else float(schedule["late_tol"]),
+                "stage_counts": dict(stage_counts),
+                "total_inner_iterations": int(eigensolver_total_inner_iterations),
+                "total_hpsi_calls": int(eigensolver_total_hpsi_calls),
+            },
+        }
+        return rho, eigvals, eigvecs, V_H, eps_xc, v_xc, diagnostics
     return rho, eigvals, eigvecs, V_H, eps_xc, v_xc
 
 
@@ -695,25 +822,26 @@ def ion_ion_energy(coords, zion):
     return e
 
 
-def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key, backend=None):
-    """Run SCF and return total energy and forces.
-
-    Args:
-        grid: Grid object produced by create_grid.
-        coords: Ion coordinates, shape (n_atoms, 3), in Bohr.
-        pseudos: List of pseudopotential dictionaries.
-        max_iter: Maximum SCF iterations.
-        mix_alpha: Anderson mixing strength.
-        tolerance: Convergence threshold for density change.
-        key: Base JAX PRNG key used to seed the SCF orbital initialization.
-
-    Returns:
-        Tuple (energy, forces) where energy is in Hartree and forces are in
-        Hartree/Bohr. Forces are currently zeros in this implementation.
-    """
+def energy_and_forces(
+    grid,
+    coords,
+    pseudos,
+    max_iter,
+    mix_alpha,
+    tolerance,
+    key,
+    backend=None,
+    *,
+    return_diagnostics=False,
+    adaptive_scf_aware_eigensolver=None,
+    adaptive_eigensolver_early_max_iter=None,
+    adaptive_eigensolver_late_max_iter=None,
+    adaptive_eigensolver_stage_residual_threshold=None,
+    adaptive_eigensolver_late_tol=None,
+):
+    """Run SCF and return total energy and forces."""
     backend = _resolve_backend(backend)
     zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
-    
     n_electrons = jnp.sum(jnp.asarray([p["q"] for p in pseudos]))
     n_bands = int(jnp.ceil(n_electrons / 2.0))
     occ = jnp.zeros((n_bands,))
@@ -722,22 +850,38 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         val = jnp.minimum(2.0, rem)
         occ = occ.at[i].set(val)
         rem -= val
-
     V_loc = backend.build_local_potential(grid, coords, pseudos)
-    rho, eigvals, eigvecs, V_H, eps_xc, v_xc = scf(
-        grid, 
-        coords, 
-        n_bands, 
-        occ, 
-        V_loc, 
-        pseudos, 
-        max_iter, 
-        mix_alpha, 
-        tolerance, 
+    scf_result = scf(
+        grid,
+        coords,
+        n_bands,
+        occ,
+        V_loc,
+        pseudos,
+        max_iter,
+        mix_alpha,
+        tolerance,
         key,
         backend=backend,
+        return_diagnostics=return_diagnostics,
+        adaptive_scf_aware_eigensolver=adaptive_scf_aware_eigensolver,
+        adaptive_eigensolver_early_max_iter=adaptive_eigensolver_early_max_iter,
+        adaptive_eigensolver_late_max_iter=adaptive_eigensolver_late_max_iter,
+        adaptive_eigensolver_stage_residual_threshold=adaptive_eigensolver_stage_residual_threshold,
+        adaptive_eigensolver_late_tol=adaptive_eigensolver_late_tol,
     )
-    
+    if return_diagnostics:
+        rho, eigvals, eigvecs, V_H, eps_xc, v_xc, diagnostics = scf_result
+    else:
+        rho, eigvals, eigvecs, V_H, eps_xc, v_xc = scf_result
+        diagnostics = None
     ion_e = ion_ion_energy(coords, zion)
     E_tot = total_energy(rho, eigvals, occ, V_loc, V_H, eps_xc, v_xc, grid, ion_e, backend=backend)
-    return E_tot, jnp.zeros_like(coords)
+    forces = jnp.zeros_like(coords)
+    if return_diagnostics:
+        diagnostics = dict(diagnostics)
+        result = dict(diagnostics.get("result", {}))
+        result["total_energy"] = float(E_tot)
+        diagnostics["result"] = result
+        return E_tot, forces, diagnostics
+    return E_tot, forces

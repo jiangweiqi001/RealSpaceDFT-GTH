@@ -61,6 +61,11 @@ class AdaptiveBackend:
         cg_maxiter: int = 800,
         cg_tol: float = 1.0e-6,
         residual_correction_steps: int = 1,
+        adaptive_scf_aware_eigensolver: bool = False,
+        adaptive_eigensolver_early_max_iter: int = 4,
+        adaptive_eigensolver_late_max_iter: int = 12,
+        adaptive_eigensolver_stage_residual_threshold: float = 1.0e-3,
+        adaptive_eigensolver_late_tol: float = 1.0e-5,
     ):
         supported = {"multipole_dirichlet", "monopole_dirichlet", "zero_dirichlet", "uniform_exterior"}
         supported_center_modes = {"box_center", "charge_center"}
@@ -82,12 +87,25 @@ class AdaptiveBackend:
             )
         if residual_correction_steps < 0:
             raise ValueError("residual_correction_steps must be nonnegative")
+        if adaptive_eigensolver_early_max_iter <= 0:
+            raise ValueError("adaptive_eigensolver_early_max_iter must be positive")
+        if adaptive_eigensolver_late_max_iter <= 0:
+            raise ValueError("adaptive_eigensolver_late_max_iter must be positive")
+        if adaptive_eigensolver_stage_residual_threshold <= 0.0:
+            raise ValueError("adaptive_eigensolver_stage_residual_threshold must be positive")
+        if adaptive_eigensolver_late_tol <= 0.0:
+            raise ValueError("adaptive_eigensolver_late_tol must be positive")
         self.hartree_boundary_mode = hartree_boundary_mode
         self.hartree_center_mode = hartree_center_mode
         self.kinetic_mode = kinetic_mode
         self.cg_maxiter = int(cg_maxiter)
         self.cg_tol = float(cg_tol)
         self.residual_correction_steps = int(residual_correction_steps)
+        self.adaptive_scf_aware_eigensolver = bool(adaptive_scf_aware_eigensolver)
+        self.adaptive_eigensolver_early_max_iter = int(adaptive_eigensolver_early_max_iter)
+        self.adaptive_eigensolver_late_max_iter = int(adaptive_eigensolver_late_max_iter)
+        self.adaptive_eigensolver_stage_residual_threshold = float(adaptive_eigensolver_stage_residual_threshold)
+        self.adaptive_eigensolver_late_tol = float(adaptive_eigensolver_late_tol)
 
     def create_grid(self, spacing: float, box_size: ArrayLike, **kwargs) -> BackendState:
         """Create an adaptive tensor grid using spacing as the minimum spacing."""
