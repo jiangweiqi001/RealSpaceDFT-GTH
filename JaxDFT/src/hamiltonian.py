@@ -4,6 +4,9 @@ Provides grid creation, GTH local pseudopotential evaluation, and a 4th-order
 finite-difference Laplacian. All quantities are in atomic units (Bohr, Hartree).
 """
 
+from functools import partial
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.scipy.special import erf, gamma
@@ -122,23 +125,66 @@ def get_gth_projector(r, l, i, rp):
     norm = jnp.sqrt(2.0) / (rp**t * jnp.sqrt(gamma(t)))
     return norm * (r**(l + 2*i - 2)) * jnp.exp(-0.5 * (r/rp)**2)
 
-@jax.jit
-def build_local_potential(atom_coords, grid_coords, zion, rloc, c):
+@partial(jax.jit, static_argnames=("local_subgrid", "local_mode", "local_patch_radius_factor"))
+def build_local_potential(
+    atom_coords,
+    grid_coords,
+    zion,
+    rloc,
+    c,
+    spacing=None,
+    local_subgrid=1,
+    local_mode="cell_average",
+    local_patch_radius_factor=6.0,
+):
     """
     Assemble total local ionic potential on the grid.
     Uses lax.fori_loop to avoid Python-loop unrolling inside jit.
     """
+    if local_subgrid < 1:
+        raise ValueError("local_subgrid must be >= 1")
+    if local_mode not in ("cell_average", "patch"):
+        raise ValueError("local_mode must be 'cell_average' or 'patch'")
+    if (local_subgrid > 1 or local_mode == "patch") and spacing is None:
+        raise ValueError("spacing is required when using local subgrid or patch mode")
+
     atom_coords = jnp.asarray(atom_coords, dtype=jnp.float32)
     zion = jnp.asarray(zion, dtype=jnp.float32)
     rloc = jnp.asarray(rloc, dtype=jnp.float32)
     c = jnp.asarray(c, dtype=jnp.float32)
 
+    if local_subgrid == 1:
+        offsets = jnp.zeros((1, 3), dtype=jnp.float32)
+    else:
+        spacing = jnp.asarray(spacing, dtype=jnp.float32)
+        axis = (jnp.arange(local_subgrid, dtype=jnp.float32) + 0.5) / local_subgrid - 0.5
+        axis = axis * spacing
+        ox, oy, oz = jnp.meshgrid(axis, axis, axis, indexing="ij")
+        offsets = jnp.stack([ox, oy, oz], axis=-1).reshape(-1, 3)
+
     init = jnp.zeros(grid_coords.shape[:-1], dtype=jnp.float32)
 
     def body(i, V_total):
-        diff = grid_coords - atom_coords[i]
-        r = jnp.sqrt(jnp.sum(diff * diff, axis=-1))
-        v = gth_local_potential_value(r, zion[i], rloc[i], c[i])
+        def offset_body(j, v_acc):
+            diff = grid_coords + offsets[j] - atom_coords[i]
+            r = jnp.sqrt(jnp.sum(diff * diff, axis=-1))
+            return v_acc + gth_local_potential_value(r, zion[i], rloc[i], c[i])
+
+        diff0 = grid_coords - atom_coords[i]
+        r0 = jnp.sqrt(jnp.sum(diff0 * diff0, axis=-1))
+        v_point = gth_local_potential_value(r0, zion[i], rloc[i], c[i])
+        v_sum = jax.lax.fori_loop(0, offsets.shape[0], offset_body, init)
+        v_average = v_sum / offsets.shape[0]
+
+        if local_mode == "patch":
+            spacing_arr = jnp.asarray(spacing, dtype=jnp.float32)
+            half_cell_diag = 0.8660254 * spacing_arr
+            radius = local_patch_radius_factor * rloc[i] + half_cell_diag
+            in_patch = r0 <= radius
+            v = jnp.where(in_patch, v_average, v_point)
+        else:
+            v = v_average
+
         return V_total + v
 
     return jax.lax.fori_loop(0, atom_coords.shape[0], body, init)
@@ -270,11 +316,157 @@ def laplacian_8th(psi, spacing, mask=None):
         lap = lap * mask
     return lap
 
-def precompute_projectors(grid, atom_coords, pseudos):
+def _make_atom_patch_points(atom_coord, radius, fine_spacing):
+    n_side = max(0, int(math.ceil(float(radius) / float(fine_spacing))))
+    axis = jnp.arange(-n_side, n_side + 1, dtype=jnp.float32) * fine_spacing
+    ox, oy, oz = jnp.meshgrid(axis, axis, axis, indexing="ij")
+    offsets = jnp.stack([ox, oy, oz], axis=-1).reshape(-1, 3)
+    mask = jnp.linalg.norm(offsets, axis=-1) <= radius + 1e-12
+    offsets = offsets[mask]
+    positions = atom_coord + offsets
+    fine_dv = fine_spacing ** 3
+    return offsets, positions, fine_dv
+
+
+def _scatter_fine_values_to_grid(grid, positions, values, fine_dv):
+    nx, ny, nz = grid.coords.shape[:-1]
+    spacing = jnp.asarray(grid.spacing, dtype=jnp.float32)
+    coarse_dv = spacing ** 3
+    origin = grid.coords[0, 0, 0]
+    scaled = (positions - origin) / spacing
+    base = jnp.floor(scaled).astype(jnp.int32)
+    frac = scaled - base.astype(jnp.float32)
+
+    valid = jnp.all(base >= 0, axis=1)
+    valid = jnp.logical_and(valid, base[:, 0] + 1 < nx)
+    valid = jnp.logical_and(valid, base[:, 1] + 1 < ny)
+    valid = jnp.logical_and(valid, base[:, 2] + 1 < nz)
+
+    flat = jnp.zeros((nx * ny * nz,), dtype=jnp.float32)
+    scale = fine_dv / coarse_dv
+    for cx in (0, 1):
+        wx = frac[:, 0] if cx else 1.0 - frac[:, 0]
+        for cy in (0, 1):
+            wy = frac[:, 1] if cy else 1.0 - frac[:, 1]
+            for cz in (0, 1):
+                wz = frac[:, 2] if cz else 1.0 - frac[:, 2]
+                idx = base + jnp.array([cx, cy, cz], dtype=jnp.int32)
+                safe_idx = jnp.where(valid[:, None], idx, 0)
+                flat_idx = safe_idx[:, 0] * (ny * nz) + safe_idx[:, 1] * nz + safe_idx[:, 2]
+                contrib = values * wx * wy * wz * scale
+                contrib = jnp.where(valid, contrib, 0.0)
+                flat = flat.at[flat_idx].add(contrib)
+
+    return flat.reshape((nx, ny, nz))
+
+
+def _precompute_projectors_patch(
+    grid,
+    atom_coords,
+    pseudos,
+    projector_subgrid,
+    projector_patch_radius_factor,
+):
+    p_i_list = []
+    p_j_list = []
+    coeff_list = []
+    fine_spacing = jnp.asarray(grid.spacing, dtype=jnp.float32) / projector_subgrid
+
+    for i_at in range(len(pseudos)):
+        p_at = pseudos[i_at]
+        if not p_at["projectors"]:
+            continue
+
+        for ch in p_at["projectors"]:
+            l = ch["l"]
+            rp = ch["r"]
+            radius = float(projector_patch_radius_factor) * float(rp)
+            offsets, positions, fine_dv = _make_atom_patch_points(
+                atom_coords[i_at], radius, fine_spacing
+            )
+            r = jnp.linalg.norm(offsets, axis=-1)
+            h_mat = jnp.array(ch["h"])
+            if h_mat.ndim == 1:
+                h_mat = jnp.diag(h_mat)
+            n_proj = h_mat.shape[0]
+            projector_cache = {}
+
+            def patch_projector(proj_idx, axis_idx=None):
+                key = (proj_idx, axis_idx)
+                if key in projector_cache:
+                    return projector_cache[key]
+
+                p_rad = get_gth_projector(r, l, proj_idx, rp)
+                if axis_idx is None:
+                    values = p_rad
+                else:
+                    values = p_rad * (offsets[:, axis_idx] / (r + 1e-12))
+                projected = _scatter_fine_values_to_grid(grid, positions, values, fine_dv)
+                projector_cache[key] = projected
+                return projected
+
+            for i in range(1, n_proj + 1):
+                for j in range(1, n_proj + 1):
+                    h_ij = h_mat[i - 1, j - 1]
+                    if float(jnp.abs(h_ij)) < 1e-10:
+                        continue
+
+                    if l == 0:
+                        p_i_list.append(patch_projector(i))
+                        p_j_list.append(patch_projector(j))
+                        coeff_list.append(h_ij / (4.0 * jnp.pi))
+                    elif l == 1:
+                        for axis in range(3):
+                            p_i_list.append(patch_projector(i, axis))
+                            p_j_list.append(patch_projector(j, axis))
+                            coeff_list.append(3.0 * h_ij / (4.0 * jnp.pi))
+
+    if not p_i_list:
+        return None
+
+    P_i = jnp.stack(p_i_list, axis=0)
+    P_j = jnp.stack(p_j_list, axis=0)
+    coeffs = jnp.array(coeff_list)
+    return P_i, P_j, coeffs
+
+
+def precompute_projectors(
+    grid,
+    atom_coords,
+    pseudos,
+    projector_subgrid=1,
+    projector_mode="cell_average",
+    projector_patch_radius_factor=6.0,
+):
     """
     在 SCF 外预先计算所有的非局域势投影器在实空间网格上的值。
     将其打包成 4D 张量，供 JAX 进行极速张量批处理。
     """
+    if projector_subgrid < 1:
+        raise ValueError("projector_subgrid must be >= 1")
+    if projector_mode not in ("cell_average", "patch"):
+        raise ValueError("projector_mode must be 'cell_average' or 'patch'")
+    if projector_mode == "patch":
+        return _precompute_projectors_patch(
+            grid,
+            atom_coords,
+            pseudos,
+            projector_subgrid,
+            projector_patch_radius_factor,
+        )
+
+    if projector_subgrid == 1:
+        offsets = jnp.zeros((1, 3), dtype=jnp.float32)
+    else:
+        axis = (
+            (jnp.arange(projector_subgrid, dtype=jnp.float32) + 0.5)
+            / projector_subgrid
+            - 0.5
+        )
+        axis = axis * jnp.asarray(grid.spacing, dtype=jnp.float32)
+        ox, oy, oz = jnp.meshgrid(axis, axis, axis, indexing="ij")
+        offsets = jnp.stack([ox, oy, oz], axis=-1).reshape(-1, 3)
+
     p_i_list = []
     p_j_list = []
     coeff_list = []
@@ -283,10 +475,6 @@ def precompute_projectors(grid, atom_coords, pseudos):
         p_at = pseudos[i_at]
         if not p_at['projectors']: continue
         
-        diff = grid.coords - atom_coords[i_at]  # (nx, ny, nz, 3)
-        r = jnp.linalg.norm(diff, axis=-1)      # (nx, ny, nz)
-        r_safe = r + 1e-12
-        
         for ch in p_at['projectors']:
             l = ch['l']
             rp = ch['r']
@@ -294,26 +482,44 @@ def precompute_projectors(grid, atom_coords, pseudos):
             if h_mat.ndim == 1:
                 h_mat = jnp.diag(h_mat)
             n_proj = h_mat.shape[0]
+
+            projector_cache = {}
+
+            def averaged_projector(proj_idx, axis_idx=None):
+                key = (proj_idx, axis_idx)
+                if key in projector_cache:
+                    return projector_cache[key]
+
+                acc = jnp.zeros(grid.coords.shape[:-1], dtype=jnp.float32)
+                for offset in offsets:
+                    diff = grid.coords + offset - atom_coords[i_at]
+                    r = jnp.linalg.norm(diff, axis=-1)
+                    p_rad = get_gth_projector(r, l, proj_idx, rp)
+                    if axis_idx is None:
+                        value = p_rad
+                    else:
+                        value = p_rad * (diff[..., axis_idx] / (r + 1e-12))
+                    acc = acc + value
+
+                averaged = acc / offsets.shape[0]
+                projector_cache[key] = averaged
+                return averaged
             
             for i in range(1, n_proj + 1):
-                p_i_rad = get_gth_projector(r, l, i, rp)
                 for j in range(1, n_proj + 1):
                     h_ij = h_mat[i-1, j-1]
-                    if jnp.abs(h_ij) < 1e-10: 
+                    if float(jnp.abs(h_ij)) < 1e-10: 
                         continue # 忽略为 0 的通道
                     
-                    p_j_rad = get_gth_projector(r, l, j, rp)
                     
                     if l == 0:
-                        p_i_list.append(p_i_rad)
-                        p_j_list.append(p_j_rad)
+                        p_i_list.append(averaged_projector(i))
+                        p_j_list.append(averaged_projector(j))
                         coeff_list.append(h_ij / (4.0 * jnp.pi))
                     elif l == 1:
                         for axis in range(3): # p型势包含三个空间方向
-                            p_i_full = p_i_rad * (diff[..., axis] / r_safe)
-                            p_j_full = p_j_rad * (diff[..., axis] / r_safe)
-                            p_i_list.append(p_i_full)
-                            p_j_list.append(p_j_full)
+                            p_i_list.append(averaged_projector(i, axis))
+                            p_j_list.append(averaged_projector(j, axis))
                             coeff_list.append(3.0 * h_ij / (4.0 * jnp.pi))
                             
     if not p_i_list:

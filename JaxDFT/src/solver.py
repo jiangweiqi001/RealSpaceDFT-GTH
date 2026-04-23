@@ -196,7 +196,21 @@ def anderson_mixing(rho, rho_new, f_hist, mix_alpha, iter_idx, m=5):
     return jax.lax.cond(iter_idx == 0, first, later, operand=None)
 
 
-def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tolerance, key):
+def scf(
+    grid,
+    coords,
+    n_bands,
+    occ,
+    V_loc,
+    projectors,
+    max_iter,
+    mix_alpha,
+    tolerance,
+    key,
+    projector_subgrid=1,
+    projector_mode="cell_average",
+    projector_patch_radius_factor=6.0,
+):
     """Run the self-consistent field (SCF) loop.
 
     Args:
@@ -210,6 +224,12 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
         mix_alpha: Anderson mixing strength.
         tolerance: Convergence threshold for density change.
         key: Base JAX PRNG key used to seed orbital initialization.
+        projector_subgrid: Number of cell-average samples per axis for
+            nonlocal projectors. The default 1 keeps point sampling.
+        projector_mode: "cell_average" for coarse-cell averaging or "patch"
+            for atom-centered fine-grid projector integration.
+        projector_patch_radius_factor: Patch radius multiplier applied to each
+            projector radius in patch mode.
 
     Returns:
         Tuple (rho, eigvals, eigvecs, V_H, eps_xc, v_xc) where energies are in
@@ -230,7 +250,14 @@ def scf(grid, coords, n_bands, occ, V_loc, projectors, max_iter, mix_alpha, tole
     f_hist = jnp.zeros((5, rho.size), dtype=jnp.float32)
     n_grid = rho.size
     kernel_k = precompute_poisson_kernel(grid.shape, grid.spacing)
-    proj_data = precompute_projectors(grid, coords, projectors)
+    proj_data = precompute_projectors(
+        grid,
+        coords,
+        projectors,
+        projector_subgrid=projector_subgrid,
+        projector_mode=projector_mode,
+        projector_patch_radius_factor=projector_patch_radius_factor,
+    )
     # 占位符
     eigvals0 = jnp.zeros((n_bands,), dtype=jnp.float32)
     eigvecs0 = jnp.zeros((n_grid, n_bands), dtype=jnp.float32)
@@ -343,7 +370,21 @@ def ion_ion_energy(coords, zion):
     return e
 
 
-def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key):
+def energy_and_forces(
+    grid,
+    coords,
+    pseudos,
+    max_iter,
+    mix_alpha,
+    tolerance,
+    key,
+    local_subgrid=1,
+    local_mode="cell_average",
+    local_patch_radius_factor=6.0,
+    projector_subgrid=1,
+    projector_mode="cell_average",
+    projector_patch_radius_factor=6.0,
+):
     """Run SCF and return total energy and forces.
 
     Args:
@@ -354,6 +395,18 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         mix_alpha: Anderson mixing strength.
         tolerance: Convergence threshold for density change.
         key: Base JAX PRNG key used to seed the SCF orbital initialization.
+        local_subgrid: Number of cell-average samples per axis for the local
+            pseudopotential. The default 1 keeps point sampling.
+        local_mode: "cell_average" to average every coarse cell or "patch" to
+            average only near each atom and keep point sampling elsewhere.
+        local_patch_radius_factor: Patch radius multiplier applied to each
+            local pseudopotential radius in patch mode.
+        projector_subgrid: Number of cell-average samples per axis for
+            nonlocal projectors. The default 1 keeps point sampling.
+        projector_mode: "cell_average" for coarse-cell averaging or "patch"
+            for atom-centered fine-grid projector integration.
+        projector_patch_radius_factor: Patch radius multiplier applied to each
+            projector radius in patch mode.
 
     Returns:
         Tuple (energy, forces) where energy is in Hartree and forces are in
@@ -372,7 +425,17 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         occ = occ.at[i].set(val)
         rem -= val
 
-    V_loc = build_local_potential(coords, grid.coords, zion, rloc, c)
+    V_loc = build_local_potential(
+        coords,
+        grid.coords,
+        zion,
+        rloc,
+        c,
+        spacing=grid.spacing,
+        local_subgrid=local_subgrid,
+        local_mode=local_mode,
+        local_patch_radius_factor=local_patch_radius_factor,
+    )
     rho, eigvals, eigvecs, V_H, eps_xc, v_xc = scf(
         grid, 
         coords, 
@@ -382,8 +445,11 @@ def energy_and_forces(grid, coords, pseudos, max_iter, mix_alpha, tolerance, key
         pseudos, 
         max_iter, 
         mix_alpha, 
-        tolerance, 
-        key
+        tolerance,
+        key,
+        projector_subgrid=projector_subgrid,
+        projector_mode=projector_mode,
+        projector_patch_radius_factor=projector_patch_radius_factor,
     )
     
     ion_e = ion_ion_energy(coords, zion)
