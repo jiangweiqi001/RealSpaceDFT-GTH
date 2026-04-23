@@ -360,6 +360,39 @@ def _scatter_fine_values_to_grid(grid, positions, values, fine_dv):
     return flat.reshape((nx, ny, nz))
 
 
+def _fine_grid_interpolation_data(grid, positions):
+    nx, ny, nz = grid.coords.shape[:-1]
+    spacing = jnp.asarray(grid.spacing, dtype=jnp.float32)
+    origin = grid.coords[0, 0, 0]
+    scaled = (positions - origin) / spacing
+    base = jnp.floor(scaled).astype(jnp.int32)
+    frac = scaled - base.astype(jnp.float32)
+
+    valid = jnp.all(base >= 0, axis=1)
+    valid = jnp.logical_and(valid, base[:, 0] + 1 < nx)
+    valid = jnp.logical_and(valid, base[:, 1] + 1 < ny)
+    valid = jnp.logical_and(valid, base[:, 2] + 1 < nz)
+
+    idx_list = []
+    weight_list = []
+    for cx in (0, 1):
+        wx = frac[:, 0] if cx else 1.0 - frac[:, 0]
+        for cy in (0, 1):
+            wy = frac[:, 1] if cy else 1.0 - frac[:, 1]
+            for cz in (0, 1):
+                wz = frac[:, 2] if cz else 1.0 - frac[:, 2]
+                idx = base + jnp.array([cx, cy, cz], dtype=jnp.int32)
+                safe_idx = jnp.where(valid[:, None], idx, 0)
+                flat_idx = safe_idx[:, 0] * (ny * nz) + safe_idx[:, 1] * nz + safe_idx[:, 2]
+                weight = jnp.where(valid, wx * wy * wz, 0.0)
+                idx_list.append(flat_idx)
+                weight_list.append(weight)
+
+    flat_indices = jnp.stack(idx_list, axis=1)
+    weights = jnp.stack(weight_list, axis=1)
+    return flat_indices, weights
+
+
 def _precompute_projectors_patch(
     grid,
     atom_coords,
@@ -367,10 +400,14 @@ def _precompute_projectors_patch(
     projector_subgrid,
     projector_patch_radius_factor,
 ):
-    p_i_list = []
-    p_j_list = []
+    p_i_fine_list = []
+    p_j_fine_list = []
     coeff_list = []
+    flat_index_list = []
+    weight_list = []
     fine_spacing = jnp.asarray(grid.spacing, dtype=jnp.float32) / projector_subgrid
+    fine_dv = fine_spacing ** 3
+    fine_to_coarse_scale = (fine_spacing / jnp.asarray(grid.spacing, dtype=jnp.float32)) ** 3
 
     for i_at in range(len(pseudos)):
         p_at = pseudos[i_at]
@@ -384,6 +421,7 @@ def _precompute_projectors_patch(
             offsets, positions, fine_dv = _make_atom_patch_points(
                 atom_coords[i_at], radius, fine_spacing
             )
+            flat_indices, weights = _fine_grid_interpolation_data(grid, positions)
             r = jnp.linalg.norm(offsets, axis=-1)
             h_mat = jnp.array(ch["h"])
             if h_mat.ndim == 1:
@@ -391,7 +429,7 @@ def _precompute_projectors_patch(
             n_proj = h_mat.shape[0]
             projector_cache = {}
 
-            def patch_projector(proj_idx, axis_idx=None):
+            def patch_projector_values(proj_idx, axis_idx=None):
                 key = (proj_idx, axis_idx)
                 if key in projector_cache:
                     return projector_cache[key]
@@ -401,9 +439,8 @@ def _precompute_projectors_patch(
                     values = p_rad
                 else:
                     values = p_rad * (offsets[:, axis_idx] / (r + 1e-12))
-                projected = _scatter_fine_values_to_grid(grid, positions, values, fine_dv)
-                projector_cache[key] = projected
-                return projected
+                projector_cache[key] = values
+                return values
 
             for i in range(1, n_proj + 1):
                 for j in range(1, n_proj + 1):
@@ -412,22 +449,28 @@ def _precompute_projectors_patch(
                         continue
 
                     if l == 0:
-                        p_i_list.append(patch_projector(i))
-                        p_j_list.append(patch_projector(j))
+                        p_i_fine_list.append(patch_projector_values(i))
+                        p_j_fine_list.append(patch_projector_values(j))
+                        flat_index_list.append(flat_indices)
+                        weight_list.append(weights)
                         coeff_list.append(h_ij / (4.0 * jnp.pi))
                     elif l == 1:
                         for axis in range(3):
-                            p_i_list.append(patch_projector(i, axis))
-                            p_j_list.append(patch_projector(j, axis))
+                            p_i_fine_list.append(patch_projector_values(i, axis))
+                            p_j_fine_list.append(patch_projector_values(j, axis))
+                            flat_index_list.append(flat_indices)
+                            weight_list.append(weights)
                             coeff_list.append(3.0 * h_ij / (4.0 * jnp.pi))
 
-    if not p_i_list:
+    if not p_i_fine_list:
         return None
 
-    P_i = jnp.stack(p_i_list, axis=0)
-    P_j = jnp.stack(p_j_list, axis=0)
+    flat_indices = jnp.stack(flat_index_list, axis=0)
+    weights = jnp.stack(weight_list, axis=0)
+    P_i = jnp.stack(p_i_fine_list, axis=0)
+    P_j = jnp.stack(p_j_fine_list, axis=0)
     coeffs = jnp.array(coeff_list)
-    return P_i, P_j, coeffs
+    return "fine_integral", flat_indices, weights, P_i, P_j, coeffs, fine_dv, fine_to_coarse_scale
 
 
 def precompute_projectors(
@@ -541,3 +584,27 @@ def apply_nonlocal_precomputed(psi, P_i, P_j, coeffs, dv):
     weight = coeffs * overlap
     # 结果累加
     return jnp.sum(weight[:, None, None, None] * P_i, axis=0)
+
+
+@jax.jit
+def apply_nonlocal_fine_integral(
+    psi,
+    flat_indices,
+    weights,
+    P_i,
+    P_j,
+    coeffs,
+    fine_dv,
+    fine_to_coarse_scale,
+):
+    """Apply nonlocal GTH projectors using fine-grid overlap + adjoint scatter."""
+    psi_flat = psi.reshape(-1)
+    psi_gather = psi_flat[flat_indices]
+    psi_fine = jnp.sum(weights * psi_gather, axis=-1)
+    overlap = jnp.sum(P_j * psi_fine, axis=1) * fine_dv
+    values_fine = P_i * (coeffs * overlap)[:, None]
+
+    flat_out = jnp.zeros_like(psi_flat)
+    contrib = values_fine[:, :, None] * weights * fine_to_coarse_scale
+    flat_out = flat_out.at[flat_indices].add(contrib)
+    return flat_out.reshape(psi.shape)

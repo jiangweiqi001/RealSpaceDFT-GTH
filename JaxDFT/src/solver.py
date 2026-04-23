@@ -8,7 +8,13 @@ the Kohn-Sham eigenproblem, and mixes the density until convergence.
 import jax
 import jax.numpy as jnp
 from .functional import lda_xc
-from .hamiltonian import laplacian_8th, build_local_potential, precompute_projectors, apply_nonlocal_precomputed
+from .hamiltonian import (
+    laplacian_8th,
+    build_local_potential,
+    precompute_projectors,
+    apply_nonlocal_precomputed,
+    apply_nonlocal_fine_integral,
+)
 
 
 def solve_orbitals_subspace(
@@ -286,8 +292,11 @@ def scf(
             lap = laplacian_8th(psi, grid.spacing, grid.mask)
             
             if proj_data is not None:
-                P_i, P_j, coeffs = proj_data
-                v_nonlocal = apply_nonlocal_precomputed(psi, P_i, P_j, coeffs, grid.volume_element)
+                if proj_data[0] == "fine_integral":
+                    v_nonlocal = apply_nonlocal_fine_integral(psi, *proj_data[1:])
+                else:
+                    P_i, P_j, coeffs = proj_data
+                    v_nonlocal = apply_nonlocal_precomputed(psi, P_i, P_j, coeffs, grid.volume_element)
             else:
                 v_nonlocal = jnp.zeros_like(psi)
             
@@ -378,6 +387,9 @@ def energy_and_forces(
     mix_alpha,
     tolerance,
     key,
+    fine_grid_mode=None,
+    fine_subgrid=5,
+    fine_grid_radius_factor=4.0,
     local_subgrid=1,
     local_mode="cell_average",
     local_patch_radius_factor=6.0,
@@ -395,6 +407,13 @@ def energy_and_forces(
         mix_alpha: Anderson mixing strength.
         tolerance: Convergence threshold for density change.
         key: Base JAX PRNG key used to seed the SCF orbital initialization.
+        fine_grid_mode: Unified fine-grid mode. None keeps the explicit
+            local/projector settings, "off" forces point sampling, and
+            "auto" or "atom_patch" enables atom-centered local-potential
+            patches while leaving nonlocal projectors on the stable coarse
+            representation.
+        fine_subgrid: Fine-grid samples per coarse-grid axis for unified modes.
+        fine_grid_radius_factor: Patch radius multiplier for unified modes.
         local_subgrid: Number of cell-average samples per axis for the local
             pseudopotential. The default 1 keeps point sampling.
         local_mode: "cell_average" to average every coarse cell or "patch" to
@@ -412,6 +431,23 @@ def energy_and_forces(
         Tuple (energy, forces) where energy is in Hartree and forces are in
         Hartree/Bohr. Forces are currently zeros in this implementation.
     """
+    if fine_grid_mode not in (None, "off", "auto", "atom_patch"):
+        raise ValueError("fine_grid_mode must be None, 'off', 'auto', or 'atom_patch'")
+    if fine_subgrid < 1:
+        raise ValueError("fine_subgrid must be >= 1")
+
+    if fine_grid_mode == "off":
+        local_subgrid = 1
+        local_mode = "cell_average"
+        projector_subgrid = 1
+        projector_mode = "cell_average"
+    elif fine_grid_mode in ("auto", "atom_patch"):
+        local_subgrid = fine_subgrid
+        local_mode = "patch"
+        local_patch_radius_factor = fine_grid_radius_factor
+        projector_subgrid = 1
+        projector_mode = "cell_average"
+
     zion = jnp.asarray([p["zion"] for p in pseudos])
     rloc = jnp.asarray([p["rloc"] for p in pseudos])
     c = jnp.asarray([p["c"] for p in pseudos])
