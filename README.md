@@ -57,6 +57,40 @@ print(f"总能量: {energy:.6f} Hartree")
 
 ---
 
+## 🔬 双重网格与 PySCF 对比 (Fine Grid Benchmark)
+
+对于随机生成的 C/H/O/N 构型，原子核通常不会正好落在主网格中心。当前推荐用法是在原子核附近启用局部细网格采样，以缓解 GTH 局域赝势带来的 egg-box 误差：
+
+```python
+energy, forces = energy_and_forces(
+    grid, coords, pseudos,
+    max_iter=500, mix_alpha=0.3, tolerance=1e-5, key=key,
+    fine_grid_mode="auto",
+    fine_subgrid=5,
+    fine_grid_radius_factor=4.0,
+)
+```
+
+当前 `fine_grid_mode="auto"` 的语义是：只对局域赝势 `V_loc` 在每个原子核附近自动打开 atom-centered patch fine grid；非局域 projector 暂不自动启用细网格，因为现有诊断显示它还需要进一步校准。
+
+可以用 H2O 对称伸缩作为一个小而敏感的基准体系：整体平移半个主网格 spacing，使 O/H 原子都不在主网格点上，然后比较同一主网格下 baseline 与 `fine_grid_mode="auto"` 是否更接近 PySCF。
+
+```bash
+MPLBACKEND=Agg python3 JaxDFT/scripts/compare_fine_grid_pyscf.py \
+  --spacing 0.40 \
+  --box-size 9.6 \
+  --output-prefix h2o_fine_grid_compare
+```
+
+该脚本使用 PySCF 的 `gth-tzvp` 基组、`gth-lda` 赝势和 `lda,pz` 泛函作为参考，并输出：
+
+- `h2o_fine_grid_compare.csv`
+- `h2o_fine_grid_compare.png`
+
+在默认 H2O off-grid 测试中，baseline 相对 PySCF 的误差约为 `0.65-3.61 Ha`，而 `fine_grid_mode="auto"` 后误差降到约 `0.029-0.042 Ha`。这说明在相同主网格下，原子核附近的 `V_loc` 细网格 patch 能显著改善与 PySCF 的一致性。
+
+---
+
 ## 🧪 核心验证结果 (Verification Results)
 
 本代码库包含多组自动化测试脚本，证明了底层的物理严谨性：
