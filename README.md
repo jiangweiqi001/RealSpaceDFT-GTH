@@ -23,6 +23,45 @@
 
 ---
 
+## 🛠️ 安装与环境建议 (Installation)
+
+推荐环境：
+
+- `WSL2 Ubuntu` + `Python 3.11` 或 `Python 3.12`
+- CPU 先跑通即可；后续再根据 JAX 安装方式切到 GPU
+
+当前项目和对比脚本更推荐在 Linux/WSL Python 环境下运行，而不是直接用 Windows 原生 Python。原因是 `PySCF` 在 Linux/WSL 下更容易直接安装到可用 wheel；在 Windows 尤其较新的 Python 版本上，常会退回源码编译并要求额外的 C/C++ 构建工具。
+
+不推荐环境：
+
+- `Windows + Python 3.13` 作为主要开发/验证环境
+
+一个稳妥的 WSL 安装示例：
+
+```bash
+cd /home/footman/RealSpaceDFT_Project/RealSpaceDFT-GTH
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r JaxDFT/requirements.txt
+```
+
+如果只运行 JaxDFT 主程序，上面的核心依赖通常就够了。
+如果还要运行和 PySCF 的对比脚本，再额外安装：
+
+```bash
+python -m pip install pyscf matplotlib
+```
+
+建议先确认解释器和依赖：
+
+```bash
+python --version
+python -m pip list | grep -E "jax|jaxlib|pyscf|matplotlib"
+```
+
+---
+
 ## 💻 快速开始 (Quick Start)
 
 JaxDFT 提供了极简的 API 来运行分子体系的 SCF 计算（所有物理量采用 **原子单位制 Hartree Atomic Units**）：
@@ -71,7 +110,34 @@ energy, forces = energy_and_forces(
 )
 ```
 
-当前 `fine_grid_mode="auto"` 的语义是：只对局域赝势 `V_loc` 在每个原子核附近自动打开 atom-centered patch fine grid；非局域 projector 暂不自动启用细网格，因为现有诊断显示它还需要进一步校准。
+当前统一接口的推荐理解如下：
+
+- `fine_grid_mode="auto"`:
+  - 当前推荐自动策略。
+  - 只对局域赝势 `V_loc` 启用 atom-centered patch fine grid。
+  - 非局域 projector 当前不会被 `auto` 自动切到细网格，因为这部分还在继续校准。
+  - 可以把它理解成当前唯一稳定的主线路径。
+- `fine_grid_mode="atom_patch"`:
+  - 语义上等同于显式要求原子核附近的 patch 细网格。
+  - 适合做可控实验或和 `auto` 对照。
+- `fine_grid_mode="off"`:
+  - 关闭细网格，回到主网格上的普通点采样/默认粗网格处理。
+- `fine_subgrid`:
+  - 每个主网格单元内部使用的细分数。
+  - 例如 `fine_subgrid=5` 表示每个 coarse cell 沿每个方向再细分 5 份。
+- `fine_grid_radius_factor`:
+  - 控制每个原子核附近 patch 的作用半径。
+  - 当前实现是按原子的局域赝势长度尺度 `rloc` 扩张，并在主网格单元尺度上再补一个小余量。
+
+当前 `fine_grid_mode="auto"` 的实际行为可以概括为：
+对每个原子，各自在核附近自动打开一个 `V_loc` 细网格 patch；离开这些 patch 后，仍然回到主网格计算。也就是说，细网格不是全盒子开启，而是只在原子核附近局部触发，这正是它兼顾精度和效率的关键。
+
+关于 nonlocal projector：
+
+- `projector_mode="patch"` 目前保留为**实验性研究能力**。
+- 它不会被 `fine_grid_mode="auto"` 自动启用。
+- 当前主线 benchmark 和推荐结论只基于 `off` 与 `fine_grid_mode="auto"` 的比较。
+- 如果要研究 projector patch，建议单独在专门脚本或 `projector_sweep` 模式下使用，不要把它和主线精度结论混在一起。
 
 可以用 H2O 对称伸缩作为一个小而敏感的基准体系：整体平移半个主网格 spacing，使 O/H 原子都不在主网格点上，然后比较同一主网格下 baseline 与 `fine_grid_mode="auto"` 是否更接近 PySCF。
 

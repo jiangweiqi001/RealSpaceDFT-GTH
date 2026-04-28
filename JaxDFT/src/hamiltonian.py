@@ -358,39 +358,169 @@ def _scatter_fine_values_to_grid(grid, positions, values, fine_dv):
                 flat = flat.at[flat_idx].add(contrib)
 
     return flat.reshape((nx, ny, nz))
+def _lagrange_weights_1d(t):
+    x = 1.0 + t
+    w0 = ((x - 1.0) * (x - 2.0) * (x - 3.0)) / -6.0
+    w1 = (x * (x - 2.0) * (x - 3.0)) / 2.0
+    w2 = (x * (x - 1.0) * (x - 3.0)) / -2.0
+    w3 = (x * (x - 1.0) * (x - 2.0)) / 6.0
+    return jnp.stack([w0, w1, w2, w3], axis=-1)
 
 
-def _fine_grid_interpolation_data(grid, positions):
+def _poly2_basis(points):
+    x = points[:, 0]
+    y = points[:, 1]
+    z = points[:, 2]
+    return jnp.stack(
+        [
+            jnp.ones_like(x),
+            x,
+            y,
+            z,
+            x * x,
+            y * y,
+            z * z,
+            x * y,
+            x * z,
+            y * z,
+        ],
+        axis=1,
+    )
+
+
+def build_patch_polynomial_reconstruction_data(grid, atom_coord, patch_positions, stencil_half_width=2, reg=1e-10):
+    nx, ny, nz = grid.coords.shape[:-1]
+    spacing = float(grid.spacing)
+    origin = grid.coords[0, 0, 0]
+    scaled = (jnp.asarray(atom_coord, dtype=jnp.float32) - origin) / spacing
+    center = jnp.rint(scaled).astype(jnp.int32)
+
+    def clipped_axis(center_axis, n_axis):
+        start = max(0, int(center_axis) - stencil_half_width)
+        stop = min(n_axis, int(center_axis) + stencil_half_width + 1)
+        return jnp.arange(start, stop, dtype=jnp.int32)
+
+    ix = clipped_axis(center[0], nx)
+    iy = clipped_axis(center[1], ny)
+    iz = clipped_axis(center[2], nz)
+    gx, gy, gz = jnp.meshgrid(ix, iy, iz, indexing="ij")
+    sample_indices_3d = jnp.stack([gx, gy, gz], axis=-1).reshape(-1, 3)
+    sample_positions = grid.coords[sample_indices_3d[:, 0], sample_indices_3d[:, 1], sample_indices_3d[:, 2]]
+    sample_rel = sample_positions - atom_coord
+    patch_rel = jnp.asarray(patch_positions, dtype=jnp.float32) - atom_coord
+
+    a = _poly2_basis(sample_rel)
+    b = _poly2_basis(patch_rel)
+    ata = a.T @ a + reg * jnp.eye(a.shape[1], dtype=jnp.float32)
+    pinv = jnp.linalg.solve(ata, a.T)
+    eval_matrix = b @ pinv
+
+    flat_indices = (
+        sample_indices_3d[:, 0] * (ny * nz)
+        + sample_indices_3d[:, 1] * nz
+        + sample_indices_3d[:, 2]
+    )
+    return flat_indices, eval_matrix
+
+
+def build_fine_interpolation_data(grid, positions):
     nx, ny, nz = grid.coords.shape[:-1]
     spacing = jnp.asarray(grid.spacing, dtype=jnp.float32)
     origin = grid.coords[0, 0, 0]
     scaled = (positions - origin) / spacing
-    base = jnp.floor(scaled).astype(jnp.int32)
-    frac = scaled - base.astype(jnp.float32)
+    cell = jnp.floor(scaled).astype(jnp.int32)
+    frac = scaled - cell.astype(jnp.float32)
 
-    valid = jnp.all(base >= 0, axis=1)
-    valid = jnp.logical_and(valid, base[:, 0] + 1 < nx)
-    valid = jnp.logical_and(valid, base[:, 1] + 1 < ny)
-    valid = jnp.logical_and(valid, base[:, 2] + 1 < nz)
+    def axis_stencil(cell_axis, frac_axis, n_axis):
+        base_axis = cell_axis - 1
+        cubic_valid = jnp.logical_and(base_axis >= 0, base_axis + 3 < n_axis)
+        linear_valid = jnp.logical_and(cell_axis >= 0, cell_axis + 1 < n_axis)
+
+        cubic_idx = base_axis[:, None] + jnp.arange(4, dtype=jnp.int32)[None, :]
+        linear_idx = jnp.stack(
+            [
+                cell_axis,
+                cell_axis + 1,
+                jnp.zeros_like(cell_axis),
+                jnp.zeros_like(cell_axis),
+            ],
+            axis=1,
+        )
+        linear_weights = jnp.stack(
+            [
+                1.0 - frac_axis,
+                frac_axis,
+                jnp.zeros_like(frac_axis),
+                jnp.zeros_like(frac_axis),
+            ],
+            axis=1,
+        )
+        idx = jnp.where(cubic_valid[:, None], cubic_idx, linear_idx)
+        weights = jnp.where(cubic_valid[:, None], _lagrange_weights_1d(frac_axis), linear_weights)
+        valid = jnp.logical_or(cubic_valid, linear_valid)
+        return idx, weights, valid
+
+    x_idx, wx, x_valid = axis_stencil(cell[:, 0], frac[:, 0], nx)
+    y_idx, wy, y_valid = axis_stencil(cell[:, 1], frac[:, 1], ny)
+    z_idx, wz, z_valid = axis_stencil(cell[:, 2], frac[:, 2], nz)
+    valid = jnp.logical_and(jnp.logical_and(x_valid, y_valid), z_valid)
 
     idx_list = []
     weight_list = []
-    for cx in (0, 1):
-        wx = frac[:, 0] if cx else 1.0 - frac[:, 0]
-        for cy in (0, 1):
-            wy = frac[:, 1] if cy else 1.0 - frac[:, 1]
-            for cz in (0, 1):
-                wz = frac[:, 2] if cz else 1.0 - frac[:, 2]
-                idx = base + jnp.array([cx, cy, cz], dtype=jnp.int32)
+    for cx in range(4):
+        for cy in range(4):
+            for cz in range(4):
+                idx = jnp.stack([x_idx[:, cx], y_idx[:, cy], z_idx[:, cz]], axis=1)
                 safe_idx = jnp.where(valid[:, None], idx, 0)
                 flat_idx = safe_idx[:, 0] * (ny * nz) + safe_idx[:, 1] * nz + safe_idx[:, 2]
-                weight = jnp.where(valid, wx * wy * wz, 0.0)
+                weight = wx[:, cx] * wy[:, cy] * wz[:, cz]
+                weight = jnp.where(valid, weight, 0.0)
                 idx_list.append(flat_idx)
                 weight_list.append(weight)
 
     flat_indices = jnp.stack(idx_list, axis=1)
     weights = jnp.stack(weight_list, axis=1)
-    return flat_indices, weights
+    return flat_indices, weights, valid
+
+
+@jax.jit
+def gather_fine_values(psi, flat_indices, weights):
+    psi_flat = psi.reshape(-1)
+    gathered = psi_flat[flat_indices]
+    return jnp.sum(weights * gathered, axis=-1)
+
+
+@jax.jit
+def reconstruct_fine_wavefunction(psi, flat_indices, weights, fine_dv):
+    psi_fine = gather_fine_values(psi, flat_indices, weights)
+    rho_fine = gather_fine_values(psi * psi, flat_indices, weights)
+    current_mass = fine_dv * jnp.sum(psi_fine * psi_fine, axis=-1)
+    target_mass = fine_dv * jnp.sum(rho_fine, axis=-1)
+    scale = jnp.sqrt(jnp.where(current_mass > 1e-20, target_mass / current_mass, 1.0))
+    return psi_fine * scale[..., None]
+
+
+@jax.jit
+def reconstruct_patch_wavefunction(psi, patch_sample_indices, patch_eval_matrix):
+    psi_flat = psi.reshape(-1)
+    coarse_samples = psi_flat[patch_sample_indices]
+    return jnp.einsum("cfs,cs->cf", patch_eval_matrix, coarse_samples)
+
+
+@partial(jax.jit, static_argnames=("output_shape",))
+def scatter_patch_wavefunction_adjoint(fine_values, output_shape, patch_sample_indices, patch_eval_matrix, fine_dv, coarse_dv):
+    flat_out = jnp.zeros((math.prod(output_shape),), dtype=jnp.asarray(fine_values).dtype)
+    sample_contrib = jnp.einsum("cfs,cf->cs", patch_eval_matrix, fine_values) * (fine_dv / coarse_dv)
+    flat_out = flat_out.at[patch_sample_indices.reshape(-1)].add(sample_contrib.reshape(-1))
+    return flat_out.reshape(output_shape)
+
+
+@partial(jax.jit, static_argnames=("output_shape",))
+def scatter_fine_values_adjoint(fine_values, output_shape, flat_indices, weights, fine_dv, coarse_dv):
+    flat_out = jnp.zeros((math.prod(output_shape),), dtype=jnp.asarray(fine_values).dtype)
+    contrib = fine_values[..., None] * weights * (fine_dv / coarse_dv)
+    flat_out = flat_out.at[flat_indices.reshape(-1)].add(contrib.reshape(-1))
+    return flat_out.reshape(output_shape)
 
 
 def _precompute_projectors_patch(
@@ -405,9 +535,11 @@ def _precompute_projectors_patch(
     coeff_list = []
     flat_index_list = []
     weight_list = []
+    patch_sample_index_list = []
+    patch_eval_matrix_list = []
     fine_spacing = jnp.asarray(grid.spacing, dtype=jnp.float32) / projector_subgrid
     fine_dv = fine_spacing ** 3
-    fine_to_coarse_scale = (fine_spacing / jnp.asarray(grid.spacing, dtype=jnp.float32)) ** 3
+    coarse_dv = jnp.asarray(grid.spacing, dtype=jnp.float32) ** 3
 
     for i_at in range(len(pseudos)):
         p_at = pseudos[i_at]
@@ -421,7 +553,12 @@ def _precompute_projectors_patch(
             offsets, positions, fine_dv = _make_atom_patch_points(
                 atom_coords[i_at], radius, fine_spacing
             )
-            flat_indices, weights = _fine_grid_interpolation_data(grid, positions)
+            flat_indices, weights, _ = build_fine_interpolation_data(grid, positions)
+            patch_sample_indices, patch_eval_matrix = build_patch_polynomial_reconstruction_data(
+                grid,
+                atom_coords[i_at],
+                positions,
+            )
             r = jnp.linalg.norm(offsets, axis=-1)
             h_mat = jnp.array(ch["h"])
             if h_mat.ndim == 1:
@@ -453,6 +590,8 @@ def _precompute_projectors_patch(
                         p_j_fine_list.append(patch_projector_values(j))
                         flat_index_list.append(flat_indices)
                         weight_list.append(weights)
+                        patch_sample_index_list.append(patch_sample_indices)
+                        patch_eval_matrix_list.append(patch_eval_matrix)
                         coeff_list.append(h_ij / (4.0 * jnp.pi))
                     elif l == 1:
                         for axis in range(3):
@@ -460,6 +599,8 @@ def _precompute_projectors_patch(
                             p_j_fine_list.append(patch_projector_values(j, axis))
                             flat_index_list.append(flat_indices)
                             weight_list.append(weights)
+                            patch_sample_index_list.append(patch_sample_indices)
+                            patch_eval_matrix_list.append(patch_eval_matrix)
                             coeff_list.append(3.0 * h_ij / (4.0 * jnp.pi))
 
     if not p_i_fine_list:
@@ -469,8 +610,21 @@ def _precompute_projectors_patch(
     weights = jnp.stack(weight_list, axis=0)
     P_i = jnp.stack(p_i_fine_list, axis=0)
     P_j = jnp.stack(p_j_fine_list, axis=0)
+    patch_sample_indices = jnp.stack(patch_sample_index_list, axis=0)
+    patch_eval_matrix = jnp.stack(patch_eval_matrix_list, axis=0)
     coeffs = jnp.array(coeff_list)
-    return "fine_integral", flat_indices, weights, P_i, P_j, coeffs, fine_dv, fine_to_coarse_scale
+    return (
+        "fine_integral",
+        flat_indices,
+        weights,
+        P_i,
+        P_j,
+        coeffs,
+        fine_dv,
+        coarse_dv,
+        patch_sample_indices,
+        patch_eval_matrix,
+    )
 
 
 def precompute_projectors(
@@ -595,16 +749,25 @@ def apply_nonlocal_fine_integral(
     P_j,
     coeffs,
     fine_dv,
-    fine_to_coarse_scale,
+    coarse_dv,
+    patch_sample_indices=None,
+    patch_eval_matrix=None,
 ):
     """Apply nonlocal GTH projectors using fine-grid overlap + adjoint scatter."""
-    psi_flat = psi.reshape(-1)
-    psi_gather = psi_flat[flat_indices]
-    psi_fine = jnp.sum(weights * psi_gather, axis=-1)
-    overlap = jnp.sum(P_j * psi_fine, axis=1) * fine_dv
-    values_fine = P_i * (coeffs * overlap)[:, None]
-
-    flat_out = jnp.zeros_like(psi_flat)
-    contrib = values_fine[:, :, None] * weights * fine_to_coarse_scale
-    flat_out = flat_out.at[flat_indices].add(contrib)
-    return flat_out.reshape(psi.shape)
+    if patch_sample_indices is not None and patch_eval_matrix is not None:
+        psi_fine = reconstruct_patch_wavefunction(psi, patch_sample_indices, patch_eval_matrix)
+        overlap = jnp.sum(P_j * psi_fine, axis=1) * fine_dv
+        values_fine = P_i * (coeffs * overlap)[:, None]
+        return scatter_patch_wavefunction_adjoint(
+            values_fine,
+            psi.shape,
+            patch_sample_indices,
+            patch_eval_matrix,
+            fine_dv,
+            coarse_dv,
+        )
+    else:
+        psi_fine = gather_fine_values(psi, flat_indices, weights)
+        overlap = jnp.sum(P_j * psi_fine, axis=1) * fine_dv
+        values_fine = P_i * (coeffs * overlap)[:, None]
+        return scatter_fine_values_adjoint(values_fine, psi.shape, flat_indices, weights, fine_dv, coarse_dv)

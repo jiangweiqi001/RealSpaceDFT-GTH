@@ -5,6 +5,8 @@ forces in Hartree/Bohr. The SCF loop builds the effective potential, solves
 the Kohn-Sham eigenproblem, and mixes the density until convergence.
 """
 
+import warnings
+
 import jax
 import jax.numpy as jnp
 from .functional import lda_xc
@@ -447,6 +449,13 @@ def energy_and_forces(
         local_patch_radius_factor = fine_grid_radius_factor
         projector_subgrid = 1
         projector_mode = "cell_average"
+    elif projector_mode == "patch":
+        warnings.warn(
+            "projector_mode='patch' is experimental and is not part of the stable "
+            "fine_grid_mode='auto' mainline. Use it only for explicit projector studies.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     zion = jnp.asarray([p["zion"] for p in pseudos])
     rloc = jnp.asarray([p["rloc"] for p in pseudos])
