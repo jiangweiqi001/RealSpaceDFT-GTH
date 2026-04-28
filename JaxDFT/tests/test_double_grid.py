@@ -90,6 +90,7 @@ class DoubleGridLocalPotentialTest(unittest.TestCase):
             local_mode="patch",
             local_patch_radius_factor=4.0,
         )
+
         averaged = build_local_potential(
             atom_coords, grid_coords, zion, rloc, c,
             spacing=0.48,

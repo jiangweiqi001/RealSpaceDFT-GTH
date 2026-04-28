@@ -125,6 +125,7 @@ def get_gth_projector(r, l, i, rp):
     norm = jnp.sqrt(2.0) / (rp**t * jnp.sqrt(gamma(t)))
     return norm * (r**(l + 2*i - 2)) * jnp.exp(-0.5 * (r/rp)**2)
 
+
 @partial(jax.jit, static_argnames=("local_subgrid", "local_mode", "local_patch_radius_factor"))
 def build_local_potential(
     atom_coords,
