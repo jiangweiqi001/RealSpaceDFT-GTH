@@ -45,15 +45,32 @@ from JaxDFT.src.mixed_state_dense_prototype import (
     solve_fixed_veff_mixed_dense_host,
 )
 from JaxDFT.src.mixed_basis_galerkin_v3 import (
+    _build_coarse_local_baseline,
+    _build_coarse_local_matrix,
     build_fixed_veff_galerkin_matrices_v3,
     build_fixed_veff_galerkin_components_v3,
+    build_selfconsistent_galerkin_matrices_v3,
     build_v3_vloc_blocks,
+    compute_v3_density_on_coarse_grid,
     compute_v3_vloc_block_expectations,
     build_patch_kinetic_value_matrix_v3,
     build_patch_physical_basis_v3,
     compute_v3_energy_decomposition,
     compute_v3_generalized_fractions,
+    reconstruct_patch_values_v3,
     solve_fixed_veff_galerkin_dense_host_v3,
+    solve_selfconsistent_galerkin_dense_host_v3,
+)
+from JaxDFT.src.mixed_basis_local_modes_v4 import (
+    build_fixed_veff_local_modes_operator_v4,
+    build_patch_local_mode_basis_v4,
+    build_fixed_veff_local_modes_components_v4,
+    build_selfconsistent_local_modes_matrices_v4,
+    compute_v4_density_on_coarse_grid,
+    solve_fixed_veff_local_modes_iterative_host_v4,
+    solve_selfconsistent_local_modes_dense_reference_v4,
+    solve_selfconsistent_local_modes_dense_host_v4,
+    solve_fixed_veff_local_modes_dense_host_v4,
 )
 
 
@@ -808,7 +825,30 @@ class MixedBasisGalerkinV3Test(unittest.TestCase):
             patch_radius_factor=4.0,
         )[0]
         patch_map = build_patch_maps(grid, [patch_spec])[0]
-        basis = build_patch_physical_basis_v3(patch_spec, patch_map, kinetic_scale=1.0)
+        zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
+        rloc = jnp.asarray([p["rloc"] for p in pseudos], dtype=jnp.float32)
+        c = jnp.asarray([p["c"] for p in pseudos], dtype=jnp.float32)
+        v_loc_patch = coarse_to_patch(
+            build_local_potential(
+                coords,
+                grid.coords,
+                zion,
+                rloc,
+                c,
+                spacing=grid.spacing,
+                local_subgrid=2,
+                local_mode="patch",
+                local_patch_radius_factor=4.0,
+            ),
+            patch_map,
+        )
+        v_loc_value = patch_map.fine_dv * jnp.diag(v_loc_patch)
+        basis = build_patch_physical_basis_v3(
+            patch_spec,
+            patch_map,
+            kinetic_scale=1.0,
+            local_potential_value=v_loc_value,
+        )
 
         self.assertGreater(basis.shape[1], 0)
         overlap_null = patch_map.eval_matrix.T @ basis
@@ -817,8 +857,10 @@ class MixedBasisGalerkinV3Test(unittest.TestCase):
             patch_map,
             kinetic_scale=1.0,
         ) @ basis
+        local_potential_null = patch_map.eval_matrix.T @ v_loc_value @ basis
         self.assertTrue(jnp.allclose(overlap_null, 0.0, atol=5e-4, rtol=5e-4))
         self.assertTrue(jnp.allclose(kinetic_null, 0.0, atol=5e-3, rtol=5e-3))
+        self.assertTrue(jnp.allclose(local_potential_null, 0.0, atol=1e-3, rtol=1e-3))
 
     def test_v3_component_matrices_sum_to_total_h(self):
         grid = create_grid(1.0, [4.0, 4.0, 4.0])
@@ -1229,6 +1271,671 @@ class MixedBasisGalerkinV3Test(unittest.TestCase):
         proj_a = basis_a @ basis_a.T
         proj_b = basis_b @ basis_b.T
         self.assertTrue(jnp.allclose(proj_a, proj_b, atol=1e-5, rtol=1e-5))
+
+    def test_v3_density_reconstruction_reduces_to_coarse_when_patch_coeffs_zero(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+        h_dense, _, coarse_size, metadata = build_fixed_veff_galerkin_matrices_v3(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=4.0,
+        )
+        total_size = h_dense.shape[0]
+        coarse_coeffs = jnp.linspace(-0.3, 0.4, coarse_size, dtype=jnp.float32)
+        eigvec = jnp.zeros((total_size, 1), dtype=jnp.float32).at[:coarse_size, 0].set(coarse_coeffs)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+
+        rho = compute_v3_density_on_coarse_grid(eigvec, occ, grid, coarse_size, metadata)
+        expected = (2.0 * coarse_coeffs**2).reshape(grid.shape)
+
+        self.assertTrue(jnp.allclose(rho, expected, atol=1e-6, rtol=1e-6))
+
+    def test_v3_selfconsistent_builder_matches_fixed_builder_when_hartree_xc_zero(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
+        rloc = jnp.asarray([p["rloc"] for p in pseudos], dtype=jnp.float32)
+        c = jnp.asarray([p["c"] for p in pseudos], dtype=jnp.float32)
+        v_loc_patch = build_local_potential(
+            coords,
+            grid.coords,
+            zion,
+            rloc,
+            c,
+            spacing=grid.spacing,
+            local_subgrid=2,
+            local_mode="patch",
+            local_patch_radius_factor=4.0,
+        )
+
+        h_fixed, s_fixed, coarse_size_fixed, _ = build_fixed_veff_galerkin_matrices_v3(
+            grid,
+            coords,
+            pseudos,
+            v_loc_patch,
+            patch_subgrid=2,
+            patch_radius_factor=4.0,
+        )
+        h_scf, s_scf, coarse_size_scf, _, _ = build_selfconsistent_galerkin_matrices_v3(
+            grid,
+            coords,
+            pseudos,
+            jnp.zeros(grid.shape, dtype=jnp.float32),
+            jnp.zeros(grid.shape, dtype=jnp.float32),
+            patch_subgrid=2,
+            patch_radius_factor=4.0,
+        )
+
+        self.assertEqual(coarse_size_fixed, coarse_size_scf)
+        self.assertTrue(jnp.allclose(h_fixed, h_scf, atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(s_fixed, s_scf, atol=1e-6, rtol=1e-6))
+
+
+class MixedBasisLocalModesV4Test(unittest.TestCase):
+    def test_v4_local_mode_basis_is_overlap_orthonormal_and_trace_orthogonal(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        patch_spec = build_atom_patch_specs(
+            grid,
+            coords,
+            pseudos,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+        )[0]
+        patch_map = build_patch_maps(grid, [patch_spec])[0]
+
+        basis = build_patch_local_mode_basis_v4(
+            patch_spec,
+            patch_map,
+            num_modes=6,
+        )
+        overlap = patch_map.fine_dv * jnp.eye(basis.shape[0], dtype=jnp.float32)
+        kinetic = build_patch_kinetic_value_matrix_v3(
+            patch_spec,
+            patch_map,
+            kinetic_scale=1.0,
+        )
+        gram = basis.T @ overlap @ basis
+        trace_null = jnp.asarray(patch_map.eval_matrix, dtype=jnp.float32).T @ overlap @ basis
+        kinetic_trace_null = jnp.asarray(patch_map.eval_matrix, dtype=jnp.float32).T @ kinetic @ basis
+
+        self.assertGreater(basis.shape[1], 0)
+        self.assertTrue(jnp.allclose(gram, jnp.eye(gram.shape[0], dtype=jnp.float32), atol=1e-4, rtol=1e-4))
+        self.assertTrue(jnp.allclose(trace_null, 0.0, atol=1e-4, rtol=1e-4))
+        self.assertTrue(jnp.allclose(kinetic_trace_null, 0.0, atol=5e-3, rtol=5e-3))
+
+    def test_v4_builds_symmetric_generalized_matrices(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+
+        h_dense, s_dense, coarse_size, _, _ = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+
+        self.assertEqual(h_dense.shape, s_dense.shape)
+        self.assertGreater(h_dense.shape[0], coarse_size)
+        self.assertTrue(jnp.allclose(h_dense, h_dense.T, atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(s_dense, s_dense.T, atol=1e-6, rtol=1e-6))
+        min_eig = jnp.min(jnp.linalg.eigvalsh(0.5 * (s_dense + s_dense.T)))
+        self.assertGreater(float(min_eig), 0.0)
+
+    def test_v4_cross_blocks_are_reciprocal(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+
+        h_dense, s_dense, coarse_size, _, _ = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+
+        h_cp = h_dense[:coarse_size, coarse_size:]
+        h_pc = h_dense[coarse_size:, :coarse_size]
+        s_cp = s_dense[:coarse_size, coarse_size:]
+        s_pc = s_dense[coarse_size:, :coarse_size]
+
+        self.assertGreater(float(jnp.linalg.norm(h_cp)), 1e-8)
+        self.assertTrue(jnp.allclose(h_cp, h_pc.T, atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(s_cp, s_pc.T, atol=1e-6, rtol=1e-6))
+
+    def test_v4_host_dense_solver_returns_finite_bands(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+
+        eigvals, eigvecs, coarse_size, _ = solve_fixed_veff_local_modes_dense_host_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=2,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+
+        self.assertEqual(eigvals.shape, (2,))
+        self.assertEqual(eigvecs.shape[1], 2)
+        self.assertGreater(eigvecs.shape[0], coarse_size)
+        self.assertTrue(jnp.all(jnp.isfinite(eigvals)))
+        self.assertLessEqual(float(eigvals[0]), float(eigvals[1]))
+
+    def test_v4_matrix_free_apply_matches_dense_matrices(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+        h_dense, s_dense, _, _, _ = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        operator = build_fixed_veff_local_modes_operator_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        size = h_dense.shape[0]
+        vec = jnp.linspace(-0.4, 0.5, size, dtype=jnp.float32)
+        mat = jnp.stack([vec, 0.7 * vec + 0.1], axis=1)
+
+        self.assertTrue(
+            jnp.allclose(
+                jnp.asarray(operator.apply_h(vec), dtype=jnp.float32),
+                h_dense @ vec,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertTrue(
+            jnp.allclose(
+                jnp.asarray(operator.apply_s(vec), dtype=jnp.float32),
+                s_dense @ vec,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertTrue(
+            jnp.allclose(
+                jnp.asarray(operator.apply_h(mat), dtype=jnp.float32),
+                h_dense @ mat,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertTrue(
+            jnp.allclose(
+                jnp.asarray(operator.apply_s(mat), dtype=jnp.float32),
+                s_dense @ mat,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+
+    def test_v4_iterative_fixed_veff_solver_matches_dense_host(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+
+        eigvals_dense, _, _, _ = solve_fixed_veff_local_modes_dense_host_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=2,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        eigvals_iter, _, _, _ = solve_fixed_veff_local_modes_iterative_host_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=2,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+            maxiter=80,
+            tol=1e-6,
+        )
+
+        self.assertTrue(
+            jnp.allclose(
+                eigvals_iter,
+                eigvals_dense,
+                atol=1e-4,
+                rtol=1e-4,
+            )
+        )
+
+    def test_v4_vnl_uses_frozen_coarse_cc_plus_patch_increment(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+
+        h_dense, s_dense, coarse_size, metadata, components = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        self.assertEqual(h_dense.shape, s_dense.shape)
+
+        coarse_proj = precompute_projectors(
+            grid,
+            coords,
+            pseudos,
+            projector_subgrid=1,
+            projector_mode="cell_average",
+        )
+        self.assertIsNotNone(coarse_proj)
+        coarse_p_i, coarse_p_j, coarse_coeffs = coarse_proj
+        n_grid = int(jnp.prod(jnp.array(grid.shape)))
+        expected_cc = jnp.zeros((n_grid, n_grid), dtype=jnp.float32)
+        for idx in range(coarse_p_i.shape[0]):
+            pi = coarse_p_i[idx].reshape(-1)
+            pj = coarse_p_j[idx].reshape(-1)
+            expected_cc = expected_cc + (grid.volume_element ** 2) * coarse_coeffs[idx] * jnp.outer(pi, pj)
+        expected_cc = 0.5 * (expected_cc + expected_cc.T)
+        self.assertTrue(
+            jnp.allclose(
+                components["v_nl"][:coarse_size, :coarse_size],
+                expected_cc,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+
+        projector_data = build_patch_projector_data(metadata.patch_specs, metadata.patch_maps, pseudos)
+        expected_cp = jnp.zeros_like(components["v_nl"][:coarse_size, coarse_size:])
+        expected_pp = jnp.zeros_like(components["v_nl"][coarse_size:, coarse_size:])
+        channel_idx = 0
+        for patch_spec, patch_map in zip(metadata.patch_specs, metadata.patch_maps):
+            basis = metadata.patch_bases[patch_spec.atom_index]
+            patch_slice = metadata.patch_slices[patch_spec.atom_index]
+            eval_matrix = jnp.asarray(patch_map.eval_matrix, dtype=jnp.float32)
+            for channel in projector_data.channels:
+                if channel.atom_index != patch_spec.atom_index:
+                    continue
+                projector_value_fine = channel.coeff * (patch_map.fine_dv ** 2) * jnp.outer(channel.p_i, channel.p_j)
+                coarse_pi_patch = coarse_to_patch(coarse_p_i[channel_idx], patch_map)
+                coarse_pj_patch = coarse_to_patch(coarse_p_j[channel_idx], patch_map)
+                projector_value_coarse = channel.coeff * (patch_map.fine_dv ** 2) * jnp.outer(coarse_pi_patch, coarse_pj_patch)
+                delta_projector_value = 0.5 * (
+                    projector_value_fine
+                    - projector_value_coarse
+                    + (projector_value_fine - projector_value_coarse).T
+                )
+                h_cp = eval_matrix.T @ delta_projector_value @ basis
+                h_pp = basis.T @ delta_projector_value @ basis
+                expected_cp = expected_cp.at[
+                    patch_map.sample_indices[:, None],
+                    jnp.arange(patch_slice.start - coarse_size, patch_slice.stop - coarse_size)[None, :],
+                ].add(h_cp)
+                expected_pp = expected_pp.at[
+                    jnp.arange(patch_slice.start - coarse_size, patch_slice.stop - coarse_size)[:, None],
+                    jnp.arange(patch_slice.start - coarse_size, patch_slice.stop - coarse_size)[None, :],
+                ].add(0.5 * (h_pp + h_pp.T))
+                channel_idx += 1
+
+        self.assertTrue(
+            jnp.allclose(
+                components["v_nl"][:coarse_size, coarse_size:],
+                expected_cp,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertTrue(
+            jnp.allclose(
+                components["v_nl"][coarse_size:, coarse_size:],
+                expected_pp,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+
+    def test_v4_density_reconstruction_reduces_to_coarse_when_patch_coeffs_zero(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.15 * grid.coords[..., 0] - 0.03 * grid.coords[..., 2]
+        h_dense, _, coarse_size, metadata, _ = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        total_size = h_dense.shape[0]
+        coarse_coeffs = jnp.linspace(-0.3, 0.4, coarse_size, dtype=jnp.float32)
+        eigvec = jnp.zeros((total_size, 1), dtype=jnp.float32).at[:coarse_size, 0].set(coarse_coeffs)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+
+        rho = compute_v4_density_on_coarse_grid(eigvec, occ, grid, coarse_size, metadata)
+        expected = (2.0 * coarse_coeffs**2).reshape(grid.shape)
+
+        self.assertTrue(jnp.allclose(rho, expected, atol=1e-6, rtol=1e-6))
+
+    def test_v4_selfconsistent_builder_matches_fixed_builder_when_hartree_xc_zero(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
+        rloc = jnp.asarray([p["rloc"] for p in pseudos], dtype=jnp.float32)
+        c = jnp.asarray([p["c"] for p in pseudos], dtype=jnp.float32)
+        v_loc_patch = build_local_potential(
+            coords,
+            grid.coords,
+            zion,
+            rloc,
+            c,
+            spacing=grid.spacing,
+            local_subgrid=2,
+            local_mode="patch",
+            local_patch_radius_factor=3.0,
+        )
+
+        h_fixed, s_fixed, coarse_size_fixed, _, _ = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            v_loc_patch,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        h_scf, s_scf, coarse_size_scf, _, _ = build_selfconsistent_local_modes_matrices_v4(
+            grid,
+            coords,
+            pseudos,
+            jnp.zeros(grid.shape, dtype=jnp.float32),
+            jnp.zeros(grid.shape, dtype=jnp.float32),
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+
+        self.assertEqual(coarse_size_fixed, coarse_size_scf)
+        self.assertTrue(jnp.allclose(h_fixed, h_scf, atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(s_fixed, s_scf, atol=1e-6, rtol=1e-6))
+
+    def test_v4_selfconsistent_builder_keeps_hartree_xc_on_frozen_coarse_cc(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
+        rloc = jnp.asarray([p["rloc"] for p in pseudos], dtype=jnp.float32)
+        c = jnp.asarray([p["c"] for p in pseudos], dtype=jnp.float32)
+        v_loc_patch = build_local_potential(
+            coords,
+            grid.coords,
+            zion,
+            rloc,
+            c,
+            spacing=grid.spacing,
+            local_subgrid=2,
+            local_mode="patch",
+            local_patch_radius_factor=3.0,
+        )
+        v_h = 0.12 * grid.coords[..., 0] - 0.04 * grid.coords[..., 2]
+        v_xc = 0.03 * grid.coords[..., 1] + 0.02
+
+        h_fixed, _, coarse_size_fixed, _, fixed_components = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            v_loc_patch,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        h_scf, _, coarse_size_scf, _, scf_components = build_selfconsistent_local_modes_matrices_v4(
+            grid,
+            coords,
+            pseudos,
+            v_h,
+            v_xc,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+
+        self.assertEqual(coarse_size_fixed, coarse_size_scf)
+        coarse_size = coarse_size_fixed
+        self.assertTrue(
+            jnp.allclose(
+                scf_components["v_loc"][coarse_size:, coarse_size:],
+                fixed_components["v_loc"][coarse_size:, coarse_size:],
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+        self.assertTrue(
+            jnp.allclose(
+                scf_components["v_loc"][:coarse_size, coarse_size:],
+                fixed_components["v_loc"][:coarse_size, coarse_size:],
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+
+        v_loc_coarse = _build_coarse_local_baseline(grid, coords, pseudos)
+        expected_cc_v_loc = _build_coarse_local_matrix(grid, v_loc_coarse + v_h + v_xc)
+        self.assertTrue(
+            jnp.allclose(
+                scf_components["v_loc"][:coarse_size, :coarse_size],
+                expected_cc_v_loc,
+                atol=1e-5,
+                rtol=1e-5,
+            )
+        )
+
+    def test_v4_iterative_selfconsistent_matches_dense_reference_on_tiny_system(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        occ = jnp.array([2.0], dtype=jnp.float32)
+
+        rho_dense, eigvals_dense, _, _, _, _, energy_dense, coarse_size_dense, _ = solve_selfconsistent_local_modes_dense_reference_v4(
+            grid,
+            coords,
+            pseudos,
+            n_bands=1,
+            occ=occ,
+            max_iter=4,
+            mix_alpha=0.2,
+            tolerance=1e-6,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+        rho_iter, eigvals_iter, _, _, _, _, energy_iter, coarse_size_iter, _ = solve_selfconsistent_local_modes_dense_host_v4(
+            grid,
+            coords,
+            pseudos,
+            n_bands=1,
+            occ=occ,
+            max_iter=4,
+            mix_alpha=0.2,
+            tolerance=1e-6,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            num_local_modes=6,
+        )
+
+        self.assertEqual(coarse_size_dense, coarse_size_iter)
+        self.assertTrue(jnp.allclose(rho_iter, rho_dense, atol=5e-4, rtol=5e-4))
+        self.assertTrue(jnp.allclose(eigvals_iter, eigvals_dense, atol=5e-4, rtol=5e-4))
+        self.assertAlmostEqual(float(energy_iter), float(energy_dense), places=3)
 
 
 class ExperimentalPatchSolverBridgeTest(unittest.TestCase):

@@ -5,10 +5,12 @@ import jax.numpy as jnp
 import numpy as np
 from scipy import linalg as scipy_linalg
 
+from .functional import lda_xc
 from .hamiltonian import build_local_potential, laplacian_8th
 from .patch_builder import build_atom_patch_specs
-from .patch_maps import build_patch_maps, coarse_to_patch
+from .patch_maps import build_patch_maps, coarse_to_patch, patch_to_coarse_adjoint
 from .patch_projector_operator import build_patch_projector_data
+from .solver import anderson_mixing, ion_ion_energy, precompute_poisson_kernel, solve_poisson, total_energy
 
 _PATCH_BASIS_RANK_TOL = 1e-6
 
@@ -71,7 +73,13 @@ def _insert_global_square_block(global_block, local_block, sample_indices):
     return global_block
 
 
-def build_patch_physical_basis_v3(patch_spec, patch_map, kinetic_scale=1.0, reg=1e-6):
+def build_patch_physical_basis_v3(
+    patch_spec,
+    patch_map,
+    kinetic_scale=1.0,
+    reg=1e-6,
+    local_potential_value=None,
+):
     _ = kinetic_scale
     _ = reg
     e = np.asarray(patch_map.eval_matrix, dtype=np.float64)
@@ -82,7 +90,11 @@ def build_patch_physical_basis_v3(patch_spec, patch_map, kinetic_scale=1.0, reg=
         ),
         dtype=np.float64,
     )
-    constraint = np.concatenate([e.T, e.T @ k], axis=0)
+    constraint_blocks = [e.T, e.T @ k]
+    if local_potential_value is not None:
+        v = np.asarray(local_potential_value, dtype=np.float64)
+        constraint_blocks.append(e.T @ v)
+    constraint = np.concatenate(constraint_blocks, axis=0)
     _, s, vt = np.linalg.svd(constraint, full_matrices=True)
     rank = int(np.sum(s > _PATCH_BASIS_RANK_TOL))
     basis = vt[rank:].T
@@ -122,17 +134,17 @@ def _build_coarse_local_baseline(grid, coords, pseudos):
     )
 
 
-def build_fixed_veff_galerkin_components_v3(
+def _build_galerkin_components_v3_from_potentials(
     grid,
     coords,
     pseudos,
-    v_eff,
+    v_cc_grid,
+    delta_v_grid,
     patch_subgrid=2,
     patch_radius_factor=4.0,
-    patch_stiffness=1.0,
-    vloc_cc_mode="patch",
 ):
-    v_eff = jnp.asarray(v_eff, dtype=jnp.float32)
+    v_cc_grid = jnp.asarray(v_cc_grid, dtype=jnp.float32)
+    delta_v_grid = jnp.asarray(delta_v_grid, dtype=jnp.float32)
     coarse_size = int(jnp.prod(jnp.array(grid.shape)))
 
     patch_specs = build_atom_patch_specs(
@@ -143,10 +155,28 @@ def build_fixed_veff_galerkin_components_v3(
         patch_radius_factor=patch_radius_factor,
     )
     patch_maps = build_patch_maps(grid, patch_specs)
+    zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
+    rloc = jnp.asarray([p["rloc"] for p in pseudos], dtype=jnp.float32)
+    c = jnp.asarray([p["c"] for p in pseudos], dtype=jnp.float32)
+    v_loc_patch_full_grid = build_local_potential(
+        coords,
+        grid.coords,
+        zion,
+        rloc,
+        c,
+        spacing=grid.spacing,
+        local_subgrid=patch_subgrid,
+        local_mode="patch",
+        local_patch_radius_factor=patch_radius_factor,
+    )
     patch_bases = {
         patch_spec.atom_index: build_patch_physical_basis_v3(
             patch_spec,
             patch_map,
+            local_potential_value=_build_patch_potential_value_matrix(
+                coarse_to_patch(v_loc_patch_full_grid, patch_map),
+                patch_map,
+            ),
         )
         for patch_spec, patch_map in zip(patch_specs, patch_maps)
     }
@@ -167,13 +197,8 @@ def build_fixed_veff_galerkin_components_v3(
     h_v_loc = np.zeros((total_size, total_size), dtype=np.float32)
     h_v_nl = np.zeros((total_size, total_size), dtype=np.float32)
 
-    if vloc_cc_mode not in ("patch", "coarse"):
-        raise ValueError("vloc_cc_mode must be 'patch' or 'coarse'")
-
     h_cc_t = _build_coarse_kinetic_matrix(grid)
-    v_eff_coarse = _build_coarse_local_baseline(grid, coords, pseudos)
-    h_cc_v_loc = _build_coarse_local_matrix(grid, v_eff_coarse)
-    delta_v_grid = v_eff - v_eff_coarse
+    h_cc_v_loc = _build_coarse_local_matrix(grid, v_cc_grid)
     h_cc_v_nl = np.zeros((coarse_size, coarse_size), dtype=np.float32)
     s_cc = grid.volume_element * jnp.eye(coarse_size, dtype=jnp.float32)
     s_dense[:coarse_size, :coarse_size] = np.asarray(s_cc, dtype=np.float32)
@@ -261,6 +286,32 @@ def build_fixed_veff_galerkin_components_v3(
         coarse_size,
         metadata,
         components,
+    )
+
+
+def build_fixed_veff_galerkin_components_v3(
+    grid,
+    coords,
+    pseudos,
+    v_eff,
+    patch_subgrid=2,
+    patch_radius_factor=4.0,
+    patch_stiffness=1.0,
+    vloc_cc_mode="patch",
+):
+    v_eff = jnp.asarray(v_eff, dtype=jnp.float32)
+    if vloc_cc_mode not in ("patch", "coarse"):
+        raise ValueError("vloc_cc_mode must be 'patch' or 'coarse'")
+    v_eff_coarse = _build_coarse_local_baseline(grid, coords, pseudos)
+    delta_v_grid = v_eff - v_eff_coarse
+    return _build_galerkin_components_v3_from_potentials(
+        grid,
+        coords,
+        pseudos,
+        v_eff_coarse,
+        delta_v_grid,
+        patch_subgrid=patch_subgrid,
+        patch_radius_factor=patch_radius_factor,
     )
 
 
@@ -385,3 +436,168 @@ def solve_fixed_veff_galerkin_dense_host_v3(
         coarse_size,
         metadata,
     )
+
+
+def reconstruct_patch_values_v3(eigvec, coarse_size, metadata):
+    vec = jnp.asarray(eigvec, dtype=jnp.float32)
+    coarse_flat = vec[:coarse_size]
+    patch_values = {}
+    for patch_map in metadata.patch_maps:
+        atom_index = patch_map.atom_index
+        patch_slice = metadata.patch_slices[atom_index]
+        basis = metadata.patch_bases[atom_index]
+        coarse_trace = patch_map.eval_matrix @ coarse_flat[patch_map.sample_indices]
+        correction = basis @ vec[patch_slice]
+        patch_values[atom_index] = coarse_trace + correction
+    return patch_values
+
+
+def compute_v3_density_on_coarse_grid(eigvecs, occ, grid, coarse_size, metadata):
+    eigvecs = jnp.asarray(eigvecs, dtype=jnp.float32)
+    occ = jnp.asarray(occ, dtype=jnp.float32)
+    n_bands = eigvecs.shape[1]
+    coarse_size = int(coarse_size)
+    rho = jnp.sum((eigvecs[:coarse_size, :] ** 2) * occ[None, :], axis=1).reshape(grid.shape)
+
+    for band in range(n_bands):
+        occ_band = float(occ[band])
+        if occ_band == 0.0:
+            continue
+        coarse_flat = eigvecs[:coarse_size, band]
+        patch_values = reconstruct_patch_values_v3(eigvecs[:, band], coarse_size, metadata)
+        for patch_map in metadata.patch_maps:
+            atom_index = patch_map.atom_index
+            trace = patch_map.eval_matrix @ coarse_flat[patch_map.sample_indices]
+            total = patch_values[atom_index]
+            delta_rho_patch = occ_band * (total ** 2 - trace ** 2)
+            rho = rho + patch_to_coarse_adjoint(delta_rho_patch, patch_map, grid.shape)
+
+    return jnp.clip(rho, 1e-12, None)
+
+
+def build_selfconsistent_galerkin_matrices_v3(
+    grid,
+    coords,
+    pseudos,
+    v_h,
+    v_xc,
+    patch_subgrid=2,
+    patch_radius_factor=4.0,
+):
+    v_h = jnp.asarray(v_h, dtype=jnp.float32)
+    v_xc = jnp.asarray(v_xc, dtype=jnp.float32)
+    zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
+    rloc = jnp.asarray([p["rloc"] for p in pseudos], dtype=jnp.float32)
+    c = jnp.asarray([p["c"] for p in pseudos], dtype=jnp.float32)
+    v_loc_coarse = build_local_potential(
+        coords,
+        grid.coords,
+        zion,
+        rloc,
+        c,
+        spacing=grid.spacing,
+        local_subgrid=1,
+        local_mode="cell_average",
+    )
+    v_loc_patch = build_local_potential(
+        coords,
+        grid.coords,
+        zion,
+        rloc,
+        c,
+        spacing=grid.spacing,
+        local_subgrid=patch_subgrid,
+        local_mode="patch",
+        local_patch_radius_factor=patch_radius_factor,
+    )
+    v_cc_grid = v_loc_coarse + v_h + v_xc
+    delta_v_grid = v_loc_patch - v_loc_coarse
+    return _build_galerkin_components_v3_from_potentials(
+        grid,
+        coords,
+        pseudos,
+        v_cc_grid,
+        delta_v_grid,
+        patch_subgrid=patch_subgrid,
+        patch_radius_factor=patch_radius_factor,
+    )
+
+
+def solve_selfconsistent_galerkin_dense_host_v3(
+    grid,
+    coords,
+    pseudos,
+    n_bands,
+    occ,
+    max_iter,
+    mix_alpha,
+    tolerance,
+    patch_subgrid=2,
+    patch_radius_factor=4.0,
+):
+    coords = jnp.asarray(coords, dtype=jnp.float32)
+    volume_element = grid.volume_element
+    rho = jnp.zeros(grid.shape, dtype=jnp.float32)
+    for atom_index in range(coords.shape[0]):
+        r = jnp.linalg.norm(grid.coords - coords[atom_index], axis=-1)
+        rho = rho + jnp.exp(-2.0 * r**2)
+    rho = rho / (jnp.sum(rho) * volume_element) * jnp.sum(occ)
+
+    f_hist = jnp.zeros((5, rho.size), dtype=jnp.float32)
+    kernel_k = precompute_poisson_kernel(grid.shape, grid.spacing)
+    eigvals = jnp.zeros((n_bands,), dtype=jnp.float32)
+    eigvecs = jnp.zeros((rho.size, n_bands), dtype=jnp.float32)
+    coarse_size = int(rho.size)
+    metadata = None
+    V_H = jnp.zeros(grid.shape, dtype=jnp.float32)
+    eps_xc = jnp.zeros(grid.shape, dtype=jnp.float32)
+    v_xc = jnp.zeros(grid.shape, dtype=jnp.float32)
+
+    for iteration in range(max_iter):
+        rho = jnp.clip(rho, 1e-12, None)
+        V_H = solve_poisson(rho, kernel_k, grid.spacing)
+        eps_xc, v_xc = lda_xc(rho)
+        h_dense, s_dense, coarse_size, metadata, _ = build_selfconsistent_galerkin_matrices_v3(
+            grid,
+            coords,
+            pseudos,
+            V_H,
+            v_xc,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+        )
+        eigvals_np, eigvecs_np = scipy_linalg.eigh(
+            np.asarray(h_dense, dtype=np.float64),
+            np.asarray(s_dense, dtype=np.float64),
+            subset_by_index=[0, n_bands - 1],
+        )
+        eigvals = jnp.asarray(eigvals_np, dtype=jnp.float32)
+        eigvecs = jnp.asarray(eigvecs_np, dtype=jnp.float32)
+        rho_new = compute_v3_density_on_coarse_grid(eigvecs, occ, grid, coarse_size, metadata)
+        diff = jnp.max(jnp.abs(rho_new - rho))
+        rho_flat, f_hist = anderson_mixing(
+            rho.reshape(-1),
+            rho_new.reshape(-1),
+            f_hist,
+            mix_alpha,
+            jnp.asarray(iteration, dtype=jnp.int32),
+        )
+        rho = rho_flat.reshape(grid.shape)
+        if float(diff) <= tolerance:
+            break
+
+    zion = jnp.asarray([p["zion"] for p in pseudos], dtype=jnp.float32)
+    ion_e = ion_ion_energy(coords, zion)
+    v_loc_final = _build_coarse_local_baseline(grid, coords, pseudos)
+    e_tot = total_energy(rho, eigvals, occ, v_loc_final, V_H, eps_xc, v_xc, volume_element, ion_e)
+    diagnostics = {
+        "rho": rho,
+        "eigvals": eigvals,
+        "eigvecs": eigvecs,
+        "coarse_size": coarse_size,
+        "metadata": metadata,
+        "V_H": V_H,
+        "eps_xc": eps_xc,
+        "v_xc": v_xc,
+    }
+    return e_tot, diagnostics
