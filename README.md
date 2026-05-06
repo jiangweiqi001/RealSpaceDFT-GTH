@@ -176,3 +176,101 @@ MPLBACKEND=Agg python3 JaxDFT/scripts/compare_fine_grid_pyscf.py \
 - projector_mode="patch" ?? experimental ??????????????????? auto ?????
 - ? spacing >= 0.2 Bohr ???????? PySCF ??????? 10-100 mHa ??????? 1-5 mHa ???
 - forces ????????????????????????????????????????????
+
+---
+
+## V5 / Enriched Galerkin Requirements
+
+This section defines the requirements for the next high-accuracy local
+representation branch.  The current stable V4 tools are useful as
+post-SCF diagnostics, but they must not be treated as the final route to
+1-5 mHa accuracy.
+
+### Goal
+
+Build an atom-centered enriched Galerkin representation that can improve
+H2O/N2/C/H/O/N systems at coarse-grid spacing `>= 0.2 Bohr` without relying on
+global grid refinement.
+
+The target is not a heuristic projector/local-potential patch.  The target is a
+single mixed representation where:
+
+- the coarse grid basis and atom-centered local basis form one Galerkin space;
+- `H`, `S`, density reconstruction, and total energy all come from the same
+continuous bilinear forms and the same physical mapping;
+- patch/local basis functions are allowed to improve occupied states strongly
+enough to matter, while preserving the meaning of the coarse main block.
+
+### Hard Requirements
+
+- The enriched basis must remain coarse-preserving.  Embedding a pure coarse
+  vector `[c; 0]` must reproduce the coarse baseline Rayleigh quotient under the
+  chosen baseline operator, up to normal solver/discretization tolerance.
+- Patch/local basis functions may be orthogonalized against the coarse space,
+  but they must not be constrained so strongly that occupied patch metric
+  fractions stay at `1e-6` by construction.  If the enriched basis never carries
+  meaningful occupied weight, it cannot deliver the target accuracy.
+- `H` and `S` must be assembled from one consistent Galerkin projection.  Do not
+  mix residual blocks, old coarse operators, and patch-local matrices unless the
+  residual is explicitly derived from the same mapping.
+- `rho` must be reconstructed from the same mixed basis used by the eigenproblem.
+  Density back-projection must be conservative and must not double count the
+  coarse contribution near nuclei.
+- `V_loc`, `V_nl`, Hartree, and XC contributions must use a consistent basis and
+  density interpretation.  A patch density contribution must not enter the
+  energy functional unless the corresponding Hamiltonian contribution is defined
+  with the same semantics.
+- Total energy must have a mixed-basis audit path.  Reporting only
+  `E_band - E_H + E_xc - int rho v_xc + E_ion` with coarse-grid assumptions is
+  not sufficient until the mixed density and mixed Hamiltonian are proven to be
+  one closed discretization.
+
+### Explicit Non-Goals / Forbidden Shortcuts
+
+- Do not make `delta_v_grid=0` post-SCF semantics the final SCF model.  That is a
+  diagnostic-safe choice, not a complete enriched DFT functional.
+- Do not tune `patch_radius_factor`, `patch_subgrid`, penalties, or stiffness
+  constants to hide a basis/energy inconsistency.
+- Do not let patch-local `V_loc` or projector information silently rewrite the
+  coarse `cc` block.  Any `cc` change must be a deliberate Galerkin projection
+  choice and must be tested against the `[c; 0]` preservation check.
+- Do not claim PySCF-level accuracy from eigenvalue shifts alone.  The total
+  energy decomposition and density feedback loop must also be consistent.
+- Do not promote the experimental branch to the mainline until H2O and N2 both
+  pass the fixed-potential, density-feedback, and total-energy audits below.
+
+### Required Validation Order
+
+1. Fixed-`V_eff` matrix audit.
+   Check symmetry, positive `S`, `[c; 0]` preservation, band decomposition, and
+   patch/coarse metric fractions for H2O and N2.
+2. Density reconstruction audit.
+   Check electron conservation, coarse/patch density split, nuclear-region
+   weight changes, and absence of local double counting.
+3. Energy decomposition audit.
+   Report `E_band`, `E_H`, `E_xc`, `int rho v_xc`, `E_ion`, and total energy
+   using the same mixed representation.  Re-solving at final `V_H + v_xc` must
+   not change the reported total energy beyond the chosen tolerance.
+4. Damped density-feedback trace.
+   Start from a converged baseline state.  Use small fixed damping such as
+   `alpha=0.05`.  Record `rho_l1`, `V_H + v_xc` change, occupied-band
+   decomposition, patch fraction, and nuclear weights for 2-5 steps.
+5. Small SCF bridge.
+   Only after the previous audits pass, run a baseline-initialized damped SCF
+   bridge.  Anderson or more aggressive mixing comes later.
+6. PySCF comparison.
+   Compare H2O and N2 against PySCF `gth-tzvp`, `gth-lda`, `lda,pz` using the
+   same geometry.  Report both total error and decomposition, not only total
+   energy.
+
+### Exit Criteria Before Mainline Consideration
+
+- H2O and N2 fixed-`V_eff` tests show meaningful but non-collapsing patch
+  response.
+- Patch metric fractions are physically interpretable rather than fixed near
+  zero by construction.
+- Density feedback does not create runaway nuclear localization.
+- Total energy is invariant under a final same-`V_H/v_xc` re-solve to within the
+  solver tolerance.
+- H2O and N2 total-energy errors move toward the 5 mHa target for the right
+  reason, confirmed by energy decomposition and density audits.

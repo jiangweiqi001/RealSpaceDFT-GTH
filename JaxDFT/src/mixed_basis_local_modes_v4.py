@@ -575,6 +575,8 @@ def build_fixed_veff_local_modes_matrices_v4(
     coords,
     pseudos,
     v_eff,
+    coarse_local_baseline=None,
+    delta_v_grid=None,
     patch_subgrid=2,
     patch_radius_factor=2.0,
     num_local_modes=8,
@@ -584,6 +586,8 @@ def build_fixed_veff_local_modes_matrices_v4(
         coords,
         pseudos,
         v_eff,
+        coarse_local_baseline=coarse_local_baseline,
+        delta_v_grid=delta_v_grid,
         patch_subgrid=patch_subgrid,
         patch_radius_factor=patch_radius_factor,
         num_local_modes=num_local_modes,
@@ -597,6 +601,8 @@ def solve_fixed_veff_local_modes_dense_host_v4(
     pseudos,
     v_eff,
     n_bands,
+    coarse_local_baseline=None,
+    delta_v_grid=None,
     patch_subgrid=2,
     patch_radius_factor=2.0,
     num_local_modes=8,
@@ -606,6 +612,8 @@ def solve_fixed_veff_local_modes_dense_host_v4(
         coords,
         pseudos,
         v_eff,
+        coarse_local_baseline=coarse_local_baseline,
+        delta_v_grid=delta_v_grid,
         patch_subgrid=patch_subgrid,
         patch_radius_factor=patch_radius_factor,
         num_local_modes=num_local_modes,
@@ -625,6 +633,8 @@ def solve_fixed_veff_local_modes_iterative_host_v4(
     pseudos,
     v_eff,
     n_bands,
+    coarse_local_baseline=None,
+    delta_v_grid=None,
     patch_subgrid=2,
     patch_radius_factor=2.0,
     num_local_modes=8,
@@ -636,6 +646,8 @@ def solve_fixed_veff_local_modes_iterative_host_v4(
         coords,
         pseudos,
         v_eff,
+        coarse_local_baseline=coarse_local_baseline,
+        delta_v_grid=delta_v_grid,
         patch_subgrid=patch_subgrid,
         patch_radius_factor=patch_radius_factor,
         num_local_modes=num_local_modes,
@@ -674,6 +686,584 @@ def solve_fixed_veff_local_modes_iterative_host_v4(
         operator.coarse_size,
         operator.metadata,
     )
+
+
+def post_scf_v4_correction(
+    grid,
+    coords,
+    pseudos,
+    rho,
+    v_h,
+    v_xc,
+    eigvals,
+    eigvecs,
+    occ,
+    v_loc_baseline,
+    delta_v_grid=None,
+    solver_mode="iterative",
+    patch_subgrid=2,
+    patch_radius_factor=2.0,
+    num_local_modes=8,
+    maxiter=160,
+    tol=1e-6,
+):
+    """Apply a fixed-Veff v4 post-SCF correction without changing coarse H_cc.
+
+    The coarse block is frozen to the converged baseline fixed potential,
+    ``v_loc_baseline + v_h + v_xc``.  Patch blocks receive only the explicitly
+    supplied ``delta_v_grid``; by default this is zero to avoid double-counting
+    any local-potential patch already present in the baseline SCF.
+    """
+    rho = jnp.asarray(rho, dtype=jnp.float32)
+    eigvals = jnp.asarray(eigvals, dtype=jnp.float32)
+    eigvecs = jnp.asarray(eigvecs, dtype=jnp.float32)
+    occ = jnp.asarray(occ, dtype=jnp.float32)
+    v_loc_baseline = jnp.asarray(v_loc_baseline, dtype=jnp.float32)
+    coarse_local_baseline = (
+        v_loc_baseline
+        + jnp.asarray(v_h, dtype=jnp.float32)
+        + jnp.asarray(v_xc, dtype=jnp.float32)
+    )
+    if delta_v_grid is None:
+        delta_v_grid = jnp.zeros_like(coarse_local_baseline)
+    else:
+        delta_v_grid = jnp.asarray(delta_v_grid, dtype=jnp.float32)
+
+    n_bands = int(eigvals.shape[0])
+    if solver_mode == "dense":
+        h_dense, s_dense, coarse_size, metadata, components = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            coarse_local_baseline,
+            coarse_local_baseline=coarse_local_baseline,
+            delta_v_grid=delta_v_grid,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+            num_local_modes=num_local_modes,
+        )
+        corrected_vals, corrected_vecs = scipy_linalg.eigh(
+            np.asarray(h_dense, dtype=np.float64),
+            np.asarray(s_dense, dtype=np.float64),
+        )
+        corrected_vals = corrected_vals[:n_bands]
+        corrected_vecs = corrected_vecs[:, :n_bands]
+    elif solver_mode == "iterative":
+        corrected_vals_jax, corrected_vecs_jax, coarse_size, metadata = solve_fixed_veff_local_modes_iterative_host_v4(
+            grid,
+            coords,
+            pseudos,
+            coarse_local_baseline,
+            n_bands=n_bands,
+            coarse_local_baseline=coarse_local_baseline,
+            delta_v_grid=delta_v_grid,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+            num_local_modes=num_local_modes,
+            maxiter=maxiter,
+            tol=tol,
+        )
+        h_dense, s_dense, coarse_size, metadata, components = build_fixed_veff_local_modes_components_v4(
+            grid,
+            coords,
+            pseudos,
+            coarse_local_baseline,
+            coarse_local_baseline=coarse_local_baseline,
+            delta_v_grid=delta_v_grid,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+            num_local_modes=num_local_modes,
+        )
+        corrected_vals = np.asarray(corrected_vals_jax, dtype=np.float64)
+        corrected_vecs = np.asarray(corrected_vecs_jax, dtype=np.float64)
+    else:
+        raise ValueError("solver_mode must be 'dense' or 'iterative'")
+
+    h_np = {name: np.asarray(mat, dtype=np.float64) for name, mat in components.items()}
+    s_np = np.asarray(s_dense, dtype=np.float64)
+    eigvecs_np = np.asarray(eigvecs, dtype=np.float64)
+    corrected_norm = np.einsum("ik,ij,jk->k", corrected_vecs, s_np, corrected_vecs)
+
+    band_decomposition = {}
+    for name, mat in h_np.items():
+        values = np.einsum("ik,ij,jk->k", corrected_vecs, mat, corrected_vecs) / corrected_norm
+        band_decomposition[name] = jnp.asarray(values, dtype=jnp.float32)
+
+    embedded_decomposition = {}
+    embedded_s = np.zeros((n_bands,), dtype=np.float64)
+    for band in range(n_bands):
+        coarse = eigvecs_np[:, band]
+        embedded_s[band] = coarse @ s_np[:coarse_size, :coarse_size] @ coarse
+    for name, mat in h_np.items():
+        mat_cc = mat[:coarse_size, :coarse_size]
+        values = np.array(
+            [eigvecs_np[:, band] @ mat_cc @ eigvecs_np[:, band] for band in range(n_bands)],
+            dtype=np.float64,
+        )
+        embedded_decomposition[name] = jnp.asarray(values, dtype=jnp.float32)
+    embedded_rayleigh = (
+        np.asarray(embedded_decomposition["t"], dtype=np.float64)
+        + np.asarray(embedded_decomposition["v_loc"], dtype=np.float64)
+        + np.asarray(embedded_decomposition["v_nl"], dtype=np.float64)
+    ) / embedded_s
+
+    s_cc = s_np[:coarse_size, :coarse_size]
+    s_pp = s_np[coarse_size:, coarse_size:]
+    coarse_norm = np.einsum(
+        "ik,ij,jk->k",
+        corrected_vecs[:coarse_size, :],
+        s_cc,
+        corrected_vecs[:coarse_size, :],
+    )
+    if s_pp.size == 0:
+        patch_norm = np.zeros_like(coarse_norm)
+    else:
+        patch_norm = np.einsum(
+            "ik,ij,jk->k",
+            corrected_vecs[coarse_size:, :],
+            s_pp,
+            corrected_vecs[coarse_size:, :],
+        )
+
+    rho_v4 = compute_v4_density_on_coarse_grid(
+        jnp.asarray(corrected_vecs, dtype=jnp.float32),
+        occ,
+        grid,
+        coarse_size,
+        metadata,
+    )
+    density_delta = rho_v4 - rho
+    density_change_l1 = jnp.sum(jnp.abs(density_delta)) * grid.volume_element
+    density_change_linf = jnp.max(jnp.abs(density_delta))
+
+    corrected_vals_jnp = jnp.asarray(corrected_vals, dtype=jnp.float32)
+    band_delta = corrected_vals_jnp - eigvals
+    return {
+        "corrected_eigvals": corrected_vals_jnp,
+        "corrected_eigvecs": jnp.asarray(corrected_vecs, dtype=jnp.float32),
+        "band_delta": band_delta,
+        "band_sum_delta": jnp.sum(band_delta * occ),
+        "band_decomposition": band_decomposition,
+        "embedded_cc_rayleigh": jnp.asarray(embedded_rayleigh, dtype=jnp.float32),
+        "embedded_s_norm": jnp.asarray(embedded_s, dtype=jnp.float32),
+        "embedded_decomposition": embedded_decomposition,
+        "density": rho_v4,
+        "density_delta": density_delta,
+        "density_change_l1": density_change_l1,
+        "density_change_linf": density_change_linf,
+        "electron_count_baseline": jnp.sum(rho) * grid.volume_element,
+        "electron_count_corrected": jnp.sum(rho_v4) * grid.volume_element,
+        "coarse_metric_fraction_diag": jnp.asarray(coarse_norm / corrected_norm, dtype=jnp.float32),
+        "patch_metric_fraction_diag": jnp.asarray(patch_norm / corrected_norm, dtype=jnp.float32),
+        "coarse_size": coarse_size,
+        "metadata": metadata,
+    }
+
+
+def _compute_nuclear_density_weights(grid, coords, rho, radius=0.75):
+    rho = jnp.asarray(rho, dtype=jnp.float32)
+    weights = []
+    for atom_index in range(int(jnp.asarray(coords).shape[0])):
+        r = jnp.linalg.norm(grid.coords - coords[atom_index], axis=-1)
+        mask = r <= float(radius)
+        weights.append(jnp.sum(jnp.where(mask, rho, 0.0)) * grid.volume_element)
+    if not weights:
+        return jnp.zeros((0,), dtype=jnp.float32)
+    return jnp.asarray(weights, dtype=jnp.float32)
+
+
+def _update_hxc_from_density(grid, rho):
+    kernel_k = precompute_poisson_kernel(grid.shape, grid.spacing)
+    rho = jnp.clip(jnp.asarray(rho, dtype=jnp.float32), 1e-12, None)
+    v_h = solve_poisson(rho, kernel_k, grid.spacing)
+    _, v_xc = lda_xc(rho)
+    return v_h, v_xc
+
+
+def post_scf_v4_one_shot_density_update(
+    grid,
+    coords,
+    pseudos,
+    rho,
+    v_h,
+    v_xc,
+    eigvals,
+    eigvecs,
+    occ,
+    v_loc_baseline,
+    delta_v_grid=None,
+    nuclear_radius=0.75,
+    solver_mode="iterative",
+    patch_subgrid=2,
+    patch_radius_factor=2.0,
+    num_local_modes=8,
+    maxiter=160,
+    tol=1e-6,
+):
+    """Run one v4 post-SCF density feedback step without SCF mixing."""
+    initial = post_scf_v4_correction(
+        grid,
+        coords,
+        pseudos,
+        rho,
+        v_h,
+        v_xc,
+        eigvals,
+        eigvecs,
+        occ,
+        v_loc_baseline,
+        delta_v_grid=delta_v_grid,
+        solver_mode=solver_mode,
+        patch_subgrid=patch_subgrid,
+        patch_radius_factor=patch_radius_factor,
+        num_local_modes=num_local_modes,
+        maxiter=maxiter,
+        tol=tol,
+    )
+    updated_v_h, updated_v_xc = _update_hxc_from_density(grid, initial["density"])
+    updated = post_scf_v4_correction(
+        grid,
+        coords,
+        pseudos,
+        initial["density"],
+        updated_v_h,
+        updated_v_xc,
+        eigvals,
+        eigvecs,
+        occ,
+        v_loc_baseline,
+        delta_v_grid=delta_v_grid,
+        solver_mode=solver_mode,
+        patch_subgrid=patch_subgrid,
+        patch_radius_factor=patch_radius_factor,
+        num_local_modes=num_local_modes,
+        maxiter=maxiter,
+        tol=tol,
+    )
+    hxc_delta = (updated_v_h + updated_v_xc) - (
+        jnp.asarray(v_h, dtype=jnp.float32) + jnp.asarray(v_xc, dtype=jnp.float32)
+    )
+    nuclear_before = _compute_nuclear_density_weights(
+        grid, coords, rho, radius=nuclear_radius
+    )
+    nuclear_after = _compute_nuclear_density_weights(
+        grid, coords, initial["density"], radius=nuclear_radius
+    )
+    return {
+        "initial_correction": initial,
+        "updated_correction": updated,
+        "updated_v_h": updated_v_h,
+        "updated_v_xc": updated_v_xc,
+        "hxc_delta": hxc_delta,
+        "hxc_delta_linf": jnp.max(jnp.abs(hxc_delta)),
+        "nuclear_weight_before": nuclear_before,
+        "nuclear_weight_after": nuclear_after,
+        "nuclear_weight_delta": nuclear_after - nuclear_before,
+    }
+
+
+def post_scf_v4_density_feedback_trace(
+    grid,
+    coords,
+    pseudos,
+    rho,
+    v_h,
+    v_xc,
+    eigvals,
+    eigvecs,
+    occ,
+    v_loc_baseline,
+    n_steps=3,
+    delta_v_grid=None,
+    nuclear_radius=0.75,
+    solver_mode="iterative",
+    patch_subgrid=2,
+    patch_radius_factor=2.0,
+    num_local_modes=8,
+    maxiter=160,
+    tol=1e-6,
+):
+    """Trace unmixed v4 density feedback for a few steps.
+
+    This intentionally does not use Anderson mixing.  Each step solves the
+    fixed-v4 problem at the current ``V_H + v_xc``, reconstructs the v4 density,
+    records diagnostics, then updates only ``V_H + v_xc`` from that density.
+    """
+    rho_current = jnp.asarray(rho, dtype=jnp.float32)
+    v_h_current = jnp.asarray(v_h, dtype=jnp.float32)
+    v_xc_current = jnp.asarray(v_xc, dtype=jnp.float32)
+    trace = []
+
+    for step in range(int(n_steps)):
+        result = post_scf_v4_correction(
+            grid,
+            coords,
+            pseudos,
+            rho_current,
+            v_h_current,
+            v_xc_current,
+            eigvals,
+            eigvecs,
+            occ,
+            v_loc_baseline,
+            delta_v_grid=delta_v_grid,
+            solver_mode=solver_mode,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+            num_local_modes=num_local_modes,
+            maxiter=maxiter,
+            tol=tol,
+        )
+        next_v_h, next_v_xc = _update_hxc_from_density(grid, result["density"])
+        hxc_delta = (next_v_h + next_v_xc) - (v_h_current + v_xc_current)
+        nuclear_before = _compute_nuclear_density_weights(
+            grid, coords, rho_current, radius=nuclear_radius
+        )
+        nuclear_after = _compute_nuclear_density_weights(
+            grid, coords, result["density"], radius=nuclear_radius
+        )
+        trace.append({
+            "step": step,
+            "corrected_eigvals": result["corrected_eigvals"],
+            "band_delta": result["band_delta"],
+            "band_sum_delta": result["band_sum_delta"],
+            "band_decomposition": result["band_decomposition"],
+            "rho_l1": result["density_change_l1"],
+            "rho_linf": result["density_change_linf"],
+            "hxc_delta_linf": jnp.max(jnp.abs(hxc_delta)),
+            "nuclear_weight": nuclear_after,
+            "nuclear_weight_delta": nuclear_after - nuclear_before,
+            "patch_metric_fraction_diag": result["patch_metric_fraction_diag"],
+            "coarse_metric_fraction_diag": result["coarse_metric_fraction_diag"],
+        })
+        rho_current = result["density"]
+        v_h_current = next_v_h
+        v_xc_current = next_v_xc
+
+    return trace
+
+
+def post_scf_v4_damped_density_feedback_trace(
+    grid,
+    coords,
+    pseudos,
+    rho,
+    v_h,
+    v_xc,
+    eigvals,
+    eigvecs,
+    occ,
+    v_loc_baseline,
+    n_steps=3,
+    alpha=0.1,
+    delta_v_grid=None,
+    nuclear_radius=0.75,
+    solver_mode="iterative",
+    patch_subgrid=2,
+    patch_radius_factor=2.0,
+    num_local_modes=8,
+    maxiter=160,
+    tol=1e-6,
+):
+    """Trace damped v4 density feedback without Anderson mixing."""
+    alpha = float(alpha)
+    if alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("alpha must satisfy 0 < alpha <= 1")
+
+    rho_current = jnp.asarray(rho, dtype=jnp.float32)
+    v_h_current = jnp.asarray(v_h, dtype=jnp.float32)
+    v_xc_current = jnp.asarray(v_xc, dtype=jnp.float32)
+    trace = []
+
+    for step in range(int(n_steps)):
+        result = post_scf_v4_correction(
+            grid,
+            coords,
+            pseudos,
+            rho_current,
+            v_h_current,
+            v_xc_current,
+            eigvals,
+            eigvecs,
+            occ,
+            v_loc_baseline,
+            delta_v_grid=delta_v_grid,
+            solver_mode=solver_mode,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+            num_local_modes=num_local_modes,
+            maxiter=maxiter,
+            tol=tol,
+        )
+        raw_density = result["density"]
+        damped_density = (1.0 - alpha) * rho_current + alpha * raw_density
+        damped_density = jnp.clip(damped_density, 1e-12, None)
+        next_v_h, next_v_xc = _update_hxc_from_density(grid, damped_density)
+        hxc_delta = (next_v_h + next_v_xc) - (v_h_current + v_xc_current)
+        raw_delta = raw_density - rho_current
+        damped_delta = damped_density - rho_current
+        nuclear_before = _compute_nuclear_density_weights(
+            grid, coords, rho_current, radius=nuclear_radius
+        )
+        nuclear_raw = _compute_nuclear_density_weights(
+            grid, coords, raw_density, radius=nuclear_radius
+        )
+        nuclear_damped = _compute_nuclear_density_weights(
+            grid, coords, damped_density, radius=nuclear_radius
+        )
+        trace.append({
+            "step": step,
+            "alpha": alpha,
+            "corrected_eigvals": result["corrected_eigvals"],
+            "band_delta": result["band_delta"],
+            "band_sum_delta": result["band_sum_delta"],
+            "band_decomposition": result["band_decomposition"],
+            "raw_rho_l1": jnp.sum(jnp.abs(raw_delta)) * grid.volume_element,
+            "raw_rho_linf": jnp.max(jnp.abs(raw_delta)),
+            "damped_rho_l1": jnp.sum(jnp.abs(damped_delta)) * grid.volume_element,
+            "damped_rho_linf": jnp.max(jnp.abs(damped_delta)),
+            "hxc_delta_linf": jnp.max(jnp.abs(hxc_delta)),
+            "nuclear_weight_raw_delta": nuclear_raw - nuclear_before,
+            "nuclear_weight_damped_delta": nuclear_damped - nuclear_before,
+            "patch_metric_fraction_diag": result["patch_metric_fraction_diag"],
+            "coarse_metric_fraction_diag": result["coarse_metric_fraction_diag"],
+        })
+        rho_current = damped_density
+        v_h_current = next_v_h
+        v_xc_current = next_v_xc
+
+    return trace
+
+
+def solve_baseline_initialized_damped_v4_scf(
+    grid,
+    coords,
+    pseudos,
+    baseline_rho,
+    baseline_v_h,
+    baseline_v_xc,
+    baseline_eigvals,
+    baseline_eigvecs,
+    occ,
+    v_loc_baseline,
+    n_steps=6,
+    alpha=0.05,
+    delta_v_grid=None,
+    nuclear_radius=0.75,
+    solver_mode="iterative",
+    patch_subgrid=2,
+    patch_radius_factor=2.0,
+    num_local_modes=8,
+    maxiter=160,
+    tol=1e-6,
+):
+    """Experimental v4 SCF bridge initialized from a converged baseline state."""
+    alpha = float(alpha)
+    if alpha <= 0.0 or alpha > 1.0:
+        raise ValueError("alpha must satisfy 0 < alpha <= 1")
+
+    rho_current = jnp.asarray(baseline_rho, dtype=jnp.float32)
+    v_h_current = jnp.asarray(baseline_v_h, dtype=jnp.float32)
+    v_xc_current = jnp.asarray(baseline_v_xc, dtype=jnp.float32)
+    eigvals_current = jnp.asarray(baseline_eigvals, dtype=jnp.float32)
+    eigvecs_current = jnp.asarray(baseline_eigvecs, dtype=jnp.float32)
+    trace = []
+    last_result = None
+
+    for step in range(int(n_steps)):
+        result = post_scf_v4_correction(
+            grid,
+            coords,
+            pseudos,
+            rho_current,
+            v_h_current,
+            v_xc_current,
+            eigvals_current,
+            eigvecs_current,
+            occ,
+            v_loc_baseline,
+            delta_v_grid=delta_v_grid,
+            solver_mode=solver_mode,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+            num_local_modes=num_local_modes,
+            maxiter=maxiter,
+            tol=tol,
+        )
+        raw_density = result["density"]
+        damped_density = jnp.clip(
+            (1.0 - alpha) * rho_current + alpha * raw_density,
+            1e-12,
+            None,
+        )
+        next_v_h, next_v_xc = _update_hxc_from_density(grid, damped_density)
+        raw_delta = raw_density - rho_current
+        damped_delta = damped_density - rho_current
+        hxc_delta = (next_v_h + next_v_xc) - (v_h_current + v_xc_current)
+        nuclear_before = _compute_nuclear_density_weights(
+            grid, coords, rho_current, radius=nuclear_radius
+        )
+        nuclear_raw = _compute_nuclear_density_weights(
+            grid, coords, raw_density, radius=nuclear_radius
+        )
+        nuclear_damped = _compute_nuclear_density_weights(
+            grid, coords, damped_density, radius=nuclear_radius
+        )
+        trace.append({
+            "step": step,
+            "alpha": alpha,
+            "corrected_eigvals": result["corrected_eigvals"],
+            "band_delta": result["band_delta"],
+            "band_sum_delta": result["band_sum_delta"],
+            "band_decomposition": result["band_decomposition"],
+            "raw_rho_l1": jnp.sum(jnp.abs(raw_delta)) * grid.volume_element,
+            "raw_rho_linf": jnp.max(jnp.abs(raw_delta)),
+            "damped_rho_l1": jnp.sum(jnp.abs(damped_delta)) * grid.volume_element,
+            "damped_rho_linf": jnp.max(jnp.abs(damped_delta)),
+            "hxc_delta_linf": jnp.max(jnp.abs(hxc_delta)),
+            "nuclear_weight_raw_delta": nuclear_raw - nuclear_before,
+            "nuclear_weight_damped_delta": nuclear_damped - nuclear_before,
+            "patch_metric_fraction_diag": result["patch_metric_fraction_diag"],
+            "coarse_metric_fraction_diag": result["coarse_metric_fraction_diag"],
+            "electron_count": jnp.sum(damped_density) * grid.volume_element,
+        })
+        rho_current = damped_density
+        v_h_current = next_v_h
+        v_xc_current = next_v_xc
+        eigvals_current = result["corrected_eigvals"]
+        eigvecs_current = result["corrected_eigvecs"][: int(jnp.prod(jnp.array(grid.shape))), :]
+        last_result = result
+
+    if last_result is None:
+        last_result = post_scf_v4_correction(
+            grid,
+            coords,
+            pseudos,
+            rho_current,
+            v_h_current,
+            v_xc_current,
+            eigvals_current,
+            eigvecs_current,
+            occ,
+            v_loc_baseline,
+            delta_v_grid=delta_v_grid,
+            solver_mode=solver_mode,
+            patch_subgrid=patch_subgrid,
+            patch_radius_factor=patch_radius_factor,
+            num_local_modes=num_local_modes,
+            maxiter=maxiter,
+            tol=tol,
+        )
+
+    return {
+        "rho": rho_current,
+        "v_h": v_h_current,
+        "v_xc": v_xc_current,
+        "eigvals": last_result["corrected_eigvals"],
+        "eigvecs": last_result["corrected_eigvecs"],
+        "trace": trace,
+        "last_correction": last_result,
+    }
 
 
 def reconstruct_patch_values_v4(eigvec, coarse_size, metadata):
