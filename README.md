@@ -274,3 +274,189 @@ enough to matter, while preserving the meaning of the coarse main block.
   solver tolerance.
 - H2O and N2 total-energy errors move toward the 5 mHa target for the right
   reason, confirmed by energy decomposition and density audits.
+
+### V5b Rewrite Plan
+
+The current V5 implementation is useful as a diagnostic branch, but it does not
+yet satisfy the requirements above.  The next implementation should be treated
+as a V5b rewrite rather than a parameter-tuning pass on the current branch.
+Every step below must include an explicit compliance check before moving to the
+next step.
+
+#### Current V5 Compliance Snapshot
+
+| Requirement | Current status | Reason |
+| --- | --- | --- |
+| Coarse-preserving `[c; 0]` semantics | Mostly satisfied | The coarse block is preserved and has tests/audits for embedded coarse Rayleigh quotients. |
+| One Galerkin `H/S` space | Partially satisfied | `S`, `T`, and `V_loc` have patch/cross blocks, but `V_nl` is still coarse-only. |
+| Mixed density from the same physical mapping | Partially satisfied | Density uses a patch increment `total_patch^2 - coarse_trace^2`, but this is not yet a fully closed mixed-basis density functional. |
+| Hxc and total-energy consistency | Not satisfied | The total-energy audit still uses a standard coarse-grid double-counting form and is explicitly diagnostic-only. |
+| No heuristic stabilization | Not satisfied | `vloc_aware_constraint` is a protective constraint that can suppress N2 over-localization but also weakens H2O corrections. |
+| Better H2O/N2 accuracy than mainline | Not satisfied | Recent H2O checks show V5 is not more accurate than the current `V_loc` auto-patch mainline. |
+
+#### Step 1: Define One Physical Mapping
+
+Goal: define a single physical map `Phi` from mixed coefficients to values on
+the selected evaluation support.
+
+Implementation requirements:
+
+- `Phi([c; a])` must include the coarse contribution and the atom-centered
+  enriched contribution in one representation.
+- The support, interpolation rule, volume weights, and boundary convention must
+  be explicit and reused by all operators.
+- A pure coarse state `[c; 0]` must reproduce the selected coarse baseline
+  semantics exactly within solver tolerance.
+
+Compliance checks:
+
+- Pass `[c; 0]` mass/Rayleigh preservation tests for H2O and N2.
+- Report `||Phi([c;0]) - coarse_trace(c)||` on every patch.
+- Fail the step if any operator uses a different support or interpolation rule.
+
+Current implementation status:
+
+- Started in `JaxDFT/src/mixed_basis_enriched_v5b.py` as a fixed-`V_eff` dense
+  prototype. The first slice keeps the coarse block frozen to the baseline
+  semantics and builds atom-centered patch coordinates on the same patch
+  interpolation support.
+- Covered by `MixedBasisEnrichedV5bTest`; full H2O/N2 `[c;0]` reporting is
+  still pending before any SCF bridge is attempted.
+
+#### Step 2: Rebuild `S`, `T`, `V_loc`, and `V_nl` From `Phi`
+
+Goal: assemble every Hamiltonian and metric block from the same Galerkin map.
+
+Implementation requirements:
+
+- `S = <Phi_i | Phi_j>`.
+- `T = 1/2 <grad Phi_i | grad Phi_j>` or the documented finite-difference
+  equivalent on the same support.
+- `V_loc = <Phi_i | V_loc | Phi_j>` using the same local-potential semantics as
+  the density/energy path.
+- `V_nl = sum_ij h_ij <Phi_i|p_i><p_j|Phi_j>` using the same projector support,
+  interpolation, and normalization as the rest of V5b.
+- No residual block such as `H_cc - T_cc - Vloc_cc` may be used unless it is
+  derived from the same `Phi` mapping and documented.
+
+Compliance checks:
+
+- Dense and matrix-free operators agree on a small grid.
+- `H = T + V_loc + V_nl` recomposes eigenvalues band-by-band.
+- `S` is symmetric positive definite after removing numerically null modes.
+- H2O and N2 fixed-`V_eff` audits show nonzero but non-collapsing patch
+  fractions.
+
+Current implementation status:
+
+- Dense fixed-`V_eff` `S/T/V_loc/V_nl` assembly is implemented in
+  `build_fixed_veff_enriched_components_v5b()`.
+- Unlike V5, `V_nl` now has explicit coarse-patch and patch-patch projector
+  blocks on the patch support.
+- Verified so far: matrix symmetry, nonzero projector patch blocks, and
+  band-by-band `H = T + V_loc + V_nl` recomposition on tiny tests.
+- Pending: matrix-free parity and real H2O/N2 fixed-`V_eff` audits.
+
+#### Step 3: Rebuild Density From the Same Mixed State
+
+Goal: reconstruct `rho` from `Phi(psi)` rather than from a separate heuristic
+patch correction.
+
+Implementation requirements:
+
+- Compute density on the same physical support used by `Phi`.
+- Conservative back-projection to the coarse grid must preserve total electron
+  count.
+- The coarse contribution near nuclei must not be double counted.
+- The density routine must expose coarse, patch, and cross/increment
+  contributions for auditing.
+
+Compliance checks:
+
+- Electron count error stays below the chosen tolerance for H2O and N2.
+- Nuclear-region density weights do not show runaway localization.
+- If patch coefficients are zero, density reduces to the baseline coarse
+  density.
+- The density split explains the sign and magnitude of Hxc feedback.
+
+#### Step 4: Define A Consistent Mixed-Basis Energy Audit
+
+Goal: evaluate total energy using the same density and Hamiltonian semantics.
+
+Implementation requirements:
+
+- Report `E_band`, `E_H`, `E_xc`, `int rho v_xc`, `E_ion`, and total energy.
+- The density used by `E_H`, `E_xc`, and `int rho v_xc` must be the V5b density.
+- A final same-`V_H/v_xc` re-solve must leave the reported total energy stable
+  within solver tolerance.
+- Do not claim accuracy from eigenvalue shifts alone.
+
+Compliance checks:
+
+- Same-Hxc re-solve delta is small for H2O and N2.
+- Energy decomposition identifies whether changes come from `T`, `V_loc`,
+  `V_nl`, or Hxc feedback.
+- Total-energy trends match the density audit; if not, stop and fix the
+  energy/density semantics before SCF.
+
+#### Step 5: Run Damped Feedback Before Full SCF
+
+Goal: test self-consistent feedback without hiding instabilities behind
+aggressive mixing.
+
+Implementation requirements:
+
+- Start from a converged mainline baseline state.
+- Use fixed damping, initially `alpha=0.05`.
+- Record per-step density change, `V_H + v_xc` change, band decomposition,
+  patch fraction, and nuclear weights.
+
+Compliance checks:
+
+- H2O and N2 do not show positive feedback into near-core localization.
+- Patch fraction remains physically interpretable and is not forced to zero by
+  constraints.
+- `vloc_aware_constraint` remains off by default; if used, it must be reported
+  as a diagnostic variant, not a production fix.
+
+#### Step 6: Only Then Run A Small SCF Bridge
+
+Goal: run a baseline-initialized damped V5b SCF bridge only after the fixed
+operator, density, and energy audits pass.
+
+Implementation requirements:
+
+- Reuse the same V5b `Phi`, operators, density, and energy audit from previous
+  steps.
+- Keep fixed damping first; Anderson mixing comes later.
+- Compare both constrained and unconstrained diagnostics if constraints still
+  exist, but do not promote a constrained result unless it has a physical basis.
+
+Compliance checks:
+
+- H2O and N2 converge or show bounded monotonic feedback under fixed damping.
+- Total energy is stable under same-Hxc re-solve at the final state.
+- The bridge improves or at least does not degrade the mainline trend before any
+  larger benchmark is attempted.
+
+#### Step 7: Compare Against Mainline And PySCF
+
+Goal: decide whether V5b has a real advantage over the stable mainline.
+
+Implementation requirements:
+
+- Compare H2O and N2 using the same geometries against:
+  - mainline baseline;
+  - mainline `fine_grid_mode="auto"` (`V_loc` atom patch only);
+  - V5b;
+  - PySCF `gth-tzvp`, `gth-lda`, `lda,pz`.
+- Report total energies, errors, energy decomposition, density metrics, patch
+  fractions, and runtime.
+
+Compliance checks:
+
+- V5b must improve the total-energy trend for H2O and N2 for the right reason.
+- If V5b is worse than `fine_grid_mode="auto"`, keep it experimental and return
+  to the failed audit step.
+- Do not promote V5b unless both systems pass fixed-potential, feedback, and
+  total-energy checks.

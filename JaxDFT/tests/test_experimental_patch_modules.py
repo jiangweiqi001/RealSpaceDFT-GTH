@@ -82,11 +82,27 @@ from JaxDFT.src.mixed_basis_local_modes_v4 import (
 )
 from JaxDFT.src.mixed_basis_enriched_v5 import (
     audit_fixed_veff_enriched_v5,
+    audit_fixed_veff_enriched_iterative_v5,
     build_atom_centered_enriched_basis_v5,
+    build_fixed_veff_enriched_operator_v5,
     build_fixed_veff_enriched_components_v5,
     compute_v5_density_on_coarse_grid,
+    dense_baseline_v5_one_shot_hxc_diagnostic,
+    mixed_basis_v5_total_energy_audit,
+    post_scf_v5_damped_feedback_trace,
     post_scf_v5_one_shot_hxc_feedback,
+    solve_baseline_initialized_damped_v5_scf,
     solve_fixed_veff_enriched_dense_host_v5,
+    solve_fixed_veff_enriched_iterative_host_v5,
+)
+from JaxDFT.src.mixed_basis_enriched_v5b import (
+    build_fixed_veff_enriched_components_v5b,
+    solve_fixed_veff_enriched_dense_host_v5b,
+)
+from JaxDFT.src.fixed_orbital_diagnostics import (
+    fixed_orbital_operator_audit,
+    fixed_veff_dense_operator_ab,
+    fixed_veff_matrix_free_operator_ab,
 )
 
 
@@ -2405,6 +2421,153 @@ class MixedBasisEnrichedV5Test(unittest.TestCase):
         self.assertTrue(jnp.all(jnp.isfinite(result["eigvals"])))
         self.assertIn("band_decomposition", result)
 
+    def test_v5_matrix_free_apply_matches_dense_components(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+        h_dense, s_dense, _, _, components = build_fixed_veff_enriched_components_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+        operator = build_fixed_veff_enriched_operator_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+        vec = jnp.linspace(-0.3, 0.4, h_dense.shape[0], dtype=jnp.float32)
+        mat = jnp.stack([vec, vec[::-1]], axis=1)
+
+        self.assertTrue(jnp.allclose(jnp.asarray(operator.apply_h(vec), dtype=jnp.float32), h_dense @ vec, atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(jnp.asarray(operator.apply_s(vec), dtype=jnp.float32), s_dense @ vec, atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(jnp.asarray(operator.apply_h(mat), dtype=jnp.float32), jnp.asarray(np.asarray(h_dense, dtype=np.float64) @ np.asarray(mat, dtype=np.float64), dtype=jnp.float32), atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(jnp.asarray(operator.apply_s(mat), dtype=jnp.float32), jnp.asarray(np.asarray(s_dense, dtype=np.float64) @ np.asarray(mat, dtype=np.float64), dtype=jnp.float32), atol=1e-5, rtol=1e-5))
+        split_apply = (
+            jnp.asarray(operator.apply_t(mat), dtype=jnp.float32)
+            + jnp.asarray(operator.apply_vloc(mat), dtype=jnp.float32)
+            + jnp.asarray(operator.apply_vnl(mat), dtype=jnp.float32)
+        )
+        self.assertTrue(jnp.allclose(split_apply, jnp.asarray(operator.apply_h(mat), dtype=jnp.float32), atol=1e-6, rtol=1e-6))
+        self.assertEqual(components["t"].shape, h_dense.shape)
+        self.assertEqual(components["v_loc"].shape, h_dense.shape)
+        self.assertEqual(components["v_nl"].shape, h_dense.shape)
+
+    def test_v5_iterative_fixed_solver_matches_dense_host(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+
+        dense = solve_fixed_veff_enriched_dense_host_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=1,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+        eigvals_iter, eigvecs_iter, coarse_size, _ = solve_fixed_veff_enriched_iterative_host_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=1,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+            maxiter=80,
+            tol=1e-6,
+        )
+
+        self.assertEqual(coarse_size, dense["coarse_size"])
+        self.assertTrue(jnp.allclose(eigvals_iter, dense["eigvals"], atol=5e-4, rtol=5e-4))
+        self.assertEqual(eigvecs_iter.shape[1], 1)
+
+    def test_v5_iterative_audit_reports_component_decomposition(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+        dense = solve_fixed_veff_enriched_dense_host_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=1,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        audit = audit_fixed_veff_enriched_iterative_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            dense["eigvals"],
+            dense["eigvecs"][:dense["coarse_size"], :],
+            n_bands=1,
+            occ=jnp.array([2.0], dtype=jnp.float32),
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+            maxiter=80,
+            tol=1e-6,
+        )
+
+        for key in ("t", "v_loc", "v_nl"):
+            self.assertIn(key, audit["band_decomposition"])
+            self.assertIn(key, audit["occupied_decomposition"])
+            self.assertIn(key, audit["embedded_baseline_decomposition"])
+        self.assertGreater(len(audit["mode_diagnostics"]), 0)
+        self.assertIn("vloc_sensitivity", audit["mode_diagnostics"][0])
+        recomposed = sum(audit["band_decomposition"][key] for key in ("t", "v_loc", "v_nl"))
+        self.assertLess(float(jnp.max(jnp.abs(recomposed - audit["corrected_eigvals"]))), 5e-4)
+
     def test_v5_fixed_audit_preserves_embedded_coarse_rayleigh(self):
         grid = create_grid(1.0, [4.0, 4.0, 4.0])
         coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
@@ -2454,6 +2617,119 @@ class MixedBasisEnrichedV5Test(unittest.TestCase):
         self.assertLess(float(jnp.abs(audit["embedded_band_delta"][0])), 1e-5)
         self.assertEqual(audit["band_delta"].shape, (1,))
         self.assertIn("occupied_decomposition", audit)
+
+    def test_v5_fixed_audit_reports_per_mode_vloc_sensitivity(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "N",
+            "zion": 5.0,
+            "rloc": 0.35,
+            "c": jnp.array([-10.0, 1.5, 0.0, 0.0], dtype=jnp.float32),
+            "q": 5.0,
+            "projectors": [{
+                "l": 1,
+                "r": 0.45,
+                "h": jnp.eye(1, dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.6 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.6)
+        h_dense, s_dense, coarse_size, _, _ = build_fixed_veff_enriched_components_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=6,
+        )
+        coarse_eigvals, coarse_eigvecs = scipy_linalg.eigh(
+            np.asarray(h_dense[:coarse_size, :coarse_size], dtype=np.float64),
+            np.asarray(s_dense[:coarse_size, :coarse_size], dtype=np.float64),
+            subset_by_index=[0, 0],
+        )
+
+        audit = audit_fixed_veff_enriched_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            baseline_eigvals=jnp.asarray(coarse_eigvals, dtype=jnp.float32),
+            baseline_eigvecs=jnp.asarray(coarse_eigvecs, dtype=jnp.float32),
+            n_bands=1,
+            occ=jnp.array([2.0], dtype=jnp.float32),
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=6,
+        )
+
+        diagnostics = audit["mode_diagnostics"]
+        self.assertGreater(len(diagnostics), 0)
+        first = diagnostics[0]
+        for key in (
+            "atom_index",
+            "symbol",
+            "mode_index",
+            "radial_channel",
+            "angular_channel",
+            "s_norm",
+            "t_expectation",
+            "v_loc_expectation",
+            "vloc_sensitivity",
+            "occupied_vloc_contribution",
+            "occupied_t_contribution",
+            "near_core_weight",
+        ):
+            self.assertIn(key, first)
+        self.assertIn(first["radial_channel"], ("core", "projector", "tail"))
+        self.assertIn(first["angular_channel"], ("s", "p"))
+        self.assertGreaterEqual(first["vloc_sensitivity"], 0.0)
+
+    def test_v5_vloc_aware_basis_constraint_reduces_local_cross_coupling(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "N",
+            "zion": 5.0,
+            "rloc": 0.35,
+            "c": jnp.array([-10.0, 1.5, 0.0, 0.0], dtype=jnp.float32),
+            "q": 5.0,
+            "projectors": [{
+                "l": 1,
+                "r": 0.45,
+                "h": jnp.eye(1, dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.8 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.6)
+        _, _, _, metadata_plain, _ = build_fixed_veff_enriched_components_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=6,
+        )
+        _, _, _, metadata_constrained, _ = build_fixed_veff_enriched_components_v5(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=6,
+            vloc_aware_constraint=True,
+        )
+
+        patch_map = metadata_plain.patch_maps[0]
+        weights = jnp.maximum(-coarse_to_patch(v_eff, patch_map), 0.0)
+        weighted_metric = np.diag(np.asarray(weights * patch_map.fine_dv, dtype=np.float64))
+        trace = np.asarray(patch_map.eval_matrix, dtype=np.float64)
+        plain_basis = np.asarray(metadata_plain.patch_bases[0], dtype=np.float64)
+        constrained_basis = np.asarray(metadata_constrained.patch_bases[0], dtype=np.float64)
+        plain_cross = np.linalg.norm(trace.T @ weighted_metric @ plain_basis)
+        constrained_cross = np.linalg.norm(trace.T @ weighted_metric @ constrained_basis)
+        self.assertLess(float(constrained_cross), float(plain_cross))
 
     def test_v5_density_reconstruction_reduces_to_coarse_when_patch_coeffs_zero(self):
         grid = create_grid(1.0, [4.0, 4.0, 4.0])
@@ -2611,6 +2887,585 @@ class MixedBasisEnrichedV5Test(unittest.TestCase):
         self.assertIn("nuclear_weight_delta", result)
         self.assertIn("baseline_hxc_residual_linf", result)
         self.assertTrue(jnp.all(jnp.isfinite(result["updated_audit"]["corrected_eigvals"])))
+
+    def test_v5_dense_baseline_diagnostic_produces_consistent_hxc_input(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_loc = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+
+        result = dense_baseline_v5_one_shot_hxc_diagnostic(
+            grid,
+            coords,
+            pseudos,
+            occ,
+            v_loc,
+            n_steps=4,
+            mix_alpha=0.25,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        self.assertIn("baseline", result)
+        self.assertIn("one_shot", result)
+        self.assertEqual(len(result["trace"]), 4)
+        self.assertEqual(result["baseline"]["rho"].shape, grid.shape)
+        self.assertLess(float(result["one_shot"]["baseline_hxc_residual_linf"]), 1e-6)
+        self.assertTrue(jnp.all(jnp.isfinite(result["one_shot"]["updated_audit"]["corrected_eigvals"])))
+
+    def test_v5_damped_feedback_trace_records_density_and_band_response(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_loc = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+        baseline = dense_baseline_v5_one_shot_hxc_diagnostic(
+            grid,
+            coords,
+            pseudos,
+            occ,
+            v_loc,
+            n_steps=3,
+            mix_alpha=0.25,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )["baseline"]
+
+        trace = post_scf_v5_damped_feedback_trace(
+            grid,
+            coords,
+            pseudos,
+            baseline["rho"],
+            baseline["v_h"],
+            baseline["v_xc"],
+            baseline["eigvals"],
+            baseline["eigvecs"],
+            occ,
+            v_loc,
+            n_steps=3,
+            alpha=0.2,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        self.assertEqual(len(trace), 3)
+        for item in trace:
+            self.assertAlmostEqual(float(item["alpha"]), 0.2, places=6)
+            self.assertIn("raw_rho_l1", item)
+            self.assertIn("damped_rho_l1", item)
+            self.assertIn("hxc_delta_linf", item)
+            self.assertIn("band_sum_delta", item)
+            self.assertIn("max_patch_fraction", item)
+            self.assertLessEqual(float(item["damped_rho_l1"]), float(item["raw_rho_l1"]) + 1e-6)
+            self.assertTrue(jnp.all(jnp.isfinite(item["corrected_eigvals"])))
+
+    def test_v5_baseline_initialized_damped_scf_returns_final_state_and_trace(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_loc = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+        baseline = dense_baseline_v5_one_shot_hxc_diagnostic(
+            grid,
+            coords,
+            pseudos,
+            occ,
+            v_loc,
+            n_steps=3,
+            mix_alpha=0.25,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )["baseline"]
+
+        result = solve_baseline_initialized_damped_v5_scf(
+            grid,
+            coords,
+            pseudos,
+            baseline["rho"],
+            baseline["v_h"],
+            baseline["v_xc"],
+            baseline["eigvals"],
+            baseline["eigvecs"],
+            occ,
+            v_loc,
+            n_steps=3,
+            alpha=0.2,
+            rho_l1_tolerance=1e-2,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        self.assertEqual(result["rho"].shape, grid.shape)
+        self.assertEqual(result["eigvals"].shape, (1,))
+        self.assertEqual(result["eigvecs"].shape[1], 1)
+        self.assertLessEqual(len(result["trace"]), 3)
+        self.assertIn("converged", result)
+        self.assertIn("n_iter", result)
+        self.assertIn("final_raw_rho_l1", result)
+        self.assertLess(float(jnp.abs(result["electron_count"] - 2.0)), 2e-4)
+        self.assertTrue(jnp.all(jnp.isfinite(result["eigvals"])))
+
+    def test_v5_baseline_initialized_damped_scf_accepts_iterative_solver_mode(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_loc = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+        baseline = dense_baseline_v5_one_shot_hxc_diagnostic(
+            grid,
+            coords,
+            pseudos,
+            occ,
+            v_loc,
+            n_steps=3,
+            mix_alpha=0.25,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )["baseline"]
+
+        result = solve_baseline_initialized_damped_v5_scf(
+            grid,
+            coords,
+            pseudos,
+            baseline["rho"],
+            baseline["v_h"],
+            baseline["v_xc"],
+            baseline["eigvals"],
+            baseline["eigvecs"],
+            occ,
+            v_loc,
+            n_steps=2,
+            alpha=0.2,
+            solver_mode="iterative",
+            eig_maxiter=80,
+            eig_tol=1e-6,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        self.assertEqual(result["rho"].shape, grid.shape)
+        self.assertEqual(len(result["trace"]), 2)
+        self.assertTrue(jnp.all(jnp.isfinite(result["eigvals"])))
+        self.assertLess(float(jnp.abs(result["electron_count"] - 2.0)), 2e-4)
+
+    def test_v5_total_energy_audit_reports_components_and_resolve_delta(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_loc = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+        baseline = dense_baseline_v5_one_shot_hxc_diagnostic(
+            grid,
+            coords,
+            pseudos,
+            occ,
+            v_loc,
+            n_steps=3,
+            mix_alpha=0.25,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )["baseline"]
+        bridge = solve_baseline_initialized_damped_v5_scf(
+            grid,
+            coords,
+            pseudos,
+            baseline["rho"],
+            baseline["v_h"],
+            baseline["v_xc"],
+            baseline["eigvals"],
+            baseline["eigvecs"],
+            occ,
+            v_loc,
+            n_steps=2,
+            alpha=0.2,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        audit = mixed_basis_v5_total_energy_audit(
+            grid,
+            coords,
+            pseudos,
+            bridge["rho"],
+            bridge["v_h"],
+            bridge["v_xc"],
+            bridge["eigvals"],
+            occ,
+            v_loc,
+            baseline["eigvals"],
+            baseline["eigvecs"],
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        for key in ("e_total", "e_band", "e_hartree", "e_xc", "e_rho_vxc", "e_ion"):
+            self.assertIn(key, audit)
+            self.assertTrue(jnp.isfinite(audit[key]))
+        self.assertIn("same_hxc_resolve_energy_delta", audit)
+        self.assertIn("resolved_density_l1", audit)
+        recomposed = audit["e_band"] - audit["e_hartree"] + audit["e_xc"] - audit["e_rho_vxc"] + audit["e_ion"]
+        self.assertLess(float(jnp.abs(audit["e_total"] - recomposed)), 1e-6)
+        self.assertLess(float(jnp.abs(audit["electron_count"] - 2.0)), 2e-4)
+
+
+class MixedBasisEnrichedV5bTest(unittest.TestCase):
+    def test_v5b_fixed_components_include_projector_patch_blocks(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "N",
+            "zion": 5.0,
+            "rloc": 0.35,
+            "c": jnp.array([-10.0, 1.5, 0.0, 0.0], dtype=jnp.float32),
+            "q": 5.0,
+            "projectors": [{
+                "l": 1,
+                "r": 0.45,
+                "h": jnp.eye(1, dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.5 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+
+        h_dense, s_dense, coarse_size, _, components = build_fixed_veff_enriched_components_v5b(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=6,
+        )
+
+        v_nl = np.asarray(components["v_nl"], dtype=np.float64)
+        self.assertEqual(h_dense.shape, s_dense.shape)
+        self.assertGreater(h_dense.shape[0], coarse_size)
+        self.assertTrue(jnp.allclose(h_dense, h_dense.T, atol=1e-5, rtol=1e-5))
+        self.assertTrue(jnp.allclose(s_dense, s_dense.T, atol=1e-6, rtol=1e-6))
+        self.assertGreater(np.linalg.norm(v_nl[:coarse_size, coarse_size:]), 1e-10)
+        self.assertGreater(np.linalg.norm(v_nl[coarse_size:, :coarse_size]), 1e-10)
+        self.assertGreater(np.linalg.norm(v_nl[coarse_size:, coarse_size:]), 1e-10)
+
+    def test_v5b_fixed_solver_decomposition_recomposes_eigenvalues(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.4 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.7)
+
+        result = solve_fixed_veff_enriched_dense_host_v5b(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=1,
+            patch_subgrid=2,
+            patch_radius_factor=3.0,
+            max_modes_per_atom=4,
+        )
+
+        recomposed = sum(result["band_decomposition"][key] for key in ("t", "v_loc", "v_nl"))
+        self.assertLess(float(jnp.max(jnp.abs(recomposed - result["eigvals"]))), 5e-5)
+        self.assertGreaterEqual(float(result["patch_metric_fraction_diag"][0]), 0.0)
+        self.assertTrue(jnp.all(jnp.isfinite(result["eigvals"])))
+
+
+class FixedOrbitalDiagnosticsTest(unittest.TestCase):
+    def test_fixed_orbital_operator_audit_reports_fine_and_coarse_matrix_elements(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_loc = build_local_potential(
+            coords,
+            grid.coords,
+            jnp.array([2.0], dtype=jnp.float32),
+            jnp.array([0.24762086], dtype=jnp.float32),
+            jnp.array([[-16.58031797, 2.39570092, 0.0, 0.0]], dtype=jnp.float32),
+            spacing=grid.spacing,
+            local_subgrid=2,
+            local_mode="patch",
+            local_patch_radius_factor=3.0,
+        )
+        psi = jnp.zeros((int(jnp.prod(jnp.asarray(grid.shape))), 1), dtype=jnp.float32)
+        psi = psi.at[0, 0].set(1.0 / jnp.sqrt(grid.volume_element))
+        occ = jnp.array([2.0], dtype=jnp.float32)
+
+        audit = fixed_orbital_operator_audit(
+            grid,
+            coords,
+            pseudos,
+            psi,
+            occ,
+            v_loc,
+            local_fine_subgrid=2,
+            coarse_projector_subgrid=1,
+            fine_projector_subgrid=2,
+            projector_patch_radius_factor=3.0,
+        )
+
+        for key in ("v_loc", "v_nl", "summary"):
+            self.assertIn(key, audit)
+        self.assertEqual(audit["v_loc"]["coarse_by_band"].shape, (1,))
+        self.assertEqual(audit["v_loc"]["fine_by_band"].shape, (1,))
+        self.assertEqual(audit["v_nl"]["coarse_by_band"].shape, (1,))
+        self.assertEqual(audit["v_nl"]["fine_by_band"].shape, (1,))
+        expected_vloc = 2.0 * v_loc.reshape(-1)[0]
+        self.assertLess(float(jnp.abs(audit["v_loc"]["coarse_by_band"][0] - expected_vloc)), 1e-6)
+        self.assertTrue(jnp.all(jnp.isfinite(audit["v_loc"]["fine_by_band"])))
+        self.assertTrue(jnp.all(jnp.isfinite(audit["v_nl"]["fine_by_band"])))
+
+    def test_fixed_orbital_cell_fine_vloc_matches_cell_average_for_constant_orbital(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_loc = build_local_potential(
+            coords,
+            grid.coords,
+            jnp.array([2.0], dtype=jnp.float32),
+            jnp.array([0.24762086], dtype=jnp.float32),
+            jnp.array([[-16.58031797, 2.39570092, 0.0, 0.0]], dtype=jnp.float32),
+            spacing=grid.spacing,
+            local_subgrid=2,
+            local_mode="cell_average",
+            local_patch_radius_factor=3.0,
+        )
+        n_grid = int(jnp.prod(jnp.asarray(grid.shape)))
+        psi = jnp.ones((n_grid, 1), dtype=jnp.float32) / jnp.sqrt(n_grid * grid.volume_element)
+        occ = jnp.array([2.0], dtype=jnp.float32)
+
+        audit = fixed_orbital_operator_audit(
+            grid,
+            coords,
+            pseudos,
+            psi,
+            occ,
+            v_loc,
+            local_fine_subgrid=2,
+            fine_projector_subgrid=2,
+            fine_mode="cell",
+        )
+
+        self.assertEqual(audit["summary"]["fine_mode"], "cell")
+        self.assertLess(
+            float(jnp.abs(audit["v_loc"]["fine_by_band"][0] - audit["v_loc"]["coarse_on_fine_support_by_band"][0])),
+            1e-5,
+        )
+
+    def test_fixed_veff_dense_operator_ab_solves_coarse_and_cell_fine_variants(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = 0.12 * grid.coords[..., 0] - 0.04 * grid.coords[..., 2]
+
+        result = fixed_veff_dense_operator_ab(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=1,
+            fine_subgrid=2,
+            coarse_projector_subgrid=1,
+        )
+
+        self.assertEqual(result["summary"]["fine_mode"], "cell")
+        self.assertEqual(set(result["variants"].keys()), {"coarse", "fine_local", "fine_projector", "fine_both"})
+        for variant in result["variants"].values():
+            self.assertEqual(variant["eigvals"].shape, (1,))
+            self.assertTrue(np.all(np.isfinite(variant["eigvals"])))
+            for key in ("t", "local", "v_nl", "total"):
+                self.assertEqual(variant["band_decomposition"][key].shape, (1,))
+                self.assertTrue(np.all(np.isfinite(variant["band_decomposition"][key])))
+
+        self.assertTrue(np.isfinite(result["matrix_deltas"]["fine_local_minus_coarse_local_norm"]))
+        self.assertTrue(np.isfinite(result["matrix_deltas"]["fine_projector_minus_coarse_projector_norm"]))
+
+    def test_fixed_veff_matrix_free_operator_ab_matches_dense_variants(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "He",
+            "zion": 2.0,
+            "rloc": 0.24762086,
+            "c": jnp.array([-16.58031797, 2.39570092, 0.0, 0.0], dtype=jnp.float32),
+            "q": 2.0,
+            "projectors": [{
+                "l": 0,
+                "r": 0.3,
+                "h": jnp.array([[1.25]], dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.3 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.8)
+
+        dense = fixed_veff_dense_operator_ab(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=2,
+            fine_subgrid=2,
+            coarse_projector_subgrid=1,
+        )
+        matrix_free = fixed_veff_matrix_free_operator_ab(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=2,
+            fine_subgrid=2,
+            coarse_projector_subgrid=1,
+            maxiter=120,
+            tol=1e-7,
+        )
+
+        self.assertEqual(set(matrix_free["variants"].keys()), set(dense["variants"].keys()))
+        for key in dense["variants"]:
+            self.assertTrue(
+                np.allclose(
+                    matrix_free["variants"][key]["eigvals"],
+                    dense["variants"][key]["eigvals"],
+                    atol=2e-4,
+                    rtol=2e-4,
+                )
+            )
+
+    def test_fixed_veff_matrix_free_operator_ab_handles_p_channel_projectors(self):
+        grid = create_grid(1.0, [4.0, 4.0, 4.0])
+        coords = jnp.array([[0.1, -0.2, 0.05]], dtype=jnp.float32)
+        pseudos = [{
+            "symbol": "N",
+            "zion": 5.0,
+            "rloc": 0.35,
+            "c": jnp.array([-10.0, 1.5, 0.0, 0.0], dtype=jnp.float32),
+            "q": 5.0,
+            "projectors": [{
+                "l": 1,
+                "r": 0.45,
+                "h": jnp.eye(1, dtype=jnp.float32),
+            }],
+        }]
+        v_eff = -0.3 * jnp.exp(-jnp.sum((grid.coords - coords[0]) ** 2, axis=-1) / 0.8)
+
+        result = fixed_veff_matrix_free_operator_ab(
+            grid,
+            coords,
+            pseudos,
+            v_eff,
+            n_bands=1,
+            fine_subgrid=2,
+            maxiter=80,
+            tol=1e-6,
+        )
+
+        self.assertTrue(np.all(np.isfinite(result["variants"]["fine_projector"]["eigvals"])))
+        self.assertTrue(np.all(np.isfinite(result["variants"]["fine_both"]["eigvals"])))
 
 
 class ExperimentalPatchSolverBridgeTest(unittest.TestCase):
