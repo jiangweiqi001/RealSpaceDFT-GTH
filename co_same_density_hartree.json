@@ -1,0 +1,83 @@
+{
+  "config": {
+    "system": "CO",
+    "box_size": 18.0,
+    "scf": {
+      "mixing_mode": "pulay",
+      "pulay_history": 3,
+      "pulay_regularization": 0.0001,
+      "mix_alpha": 0.2,
+      "pulay_residual_metric": "kerker",
+      "pulay_kerker_k0": 2.0,
+      "scf_convergence_metric": "rms",
+      "tolerance": 3e-05,
+      "max_iter": 250,
+      "orbital_max_iter": 30,
+      "orbital_preconditioner": "none",
+      "energy_tolerance": 1e-06
+    }
+  },
+  "same_density_hartree_mHa": [
+    {
+      "target_spacing": 0.14,
+      "actual_spacing": 0.13953489065170288,
+      "box_size": 18.0,
+      "grid_shape": [
+        130,
+        130,
+        130
+      ],
+      "seconds": 7.102299451828003,
+      "delta_hartree_vs_pyscf_coul_mHa": -14.04264094893648,
+      "delta_xc_vs_pyscf_exc_mHa": 0.004676754980614817,
+      "rho_electron_count_error": -4.76837158203125e-06,
+      "pyscf_converged": true
+    },
+    {
+      "target_spacing": 0.12,
+      "actual_spacing": 0.11999999731779099,
+      "box_size": 18.0,
+      "grid_shape": [
+        151,
+        151,
+        151
+      ],
+      "seconds": 5.621958017349243,
+      "delta_hartree_vs_pyscf_coul_mHa": -10.380531573872531,
+      "delta_xc_vs_pyscf_exc_mHa": -0.015350405673686396,
+      "rho_electron_count_error": -9.5367431640625e-07,
+      "pyscf_converged": true
+    },
+    {
+      "target_spacing": 0.1,
+      "actual_spacing": 0.10000000149011612,
+      "box_size": 18.0,
+      "grid_shape": [
+        181,
+        181,
+        181
+      ],
+      "seconds": 6.224314212799072,
+      "delta_hartree_vs_pyscf_coul_mHa": -7.248665118709141,
+      "delta_xc_vs_pyscf_exc_mHa": -0.0034294767301545903,
+      "rho_electron_count_error": -2.86102294921875e-06,
+      "pyscf_converged": true
+    },
+    {
+      "target_spacing": 0.08,
+      "actual_spacing": 0.07999999821186066,
+      "box_size": 18.0,
+      "grid_shape": [
+        226,
+        226,
+        226
+      ],
+      "seconds": 7.9095447063446045,
+      "delta_hartree_vs_pyscf_coul_mHa": -4.660393024149556,
+      "delta_xc_vs_pyscf_exc_mHa": -0.0029526395488588264,
+      "rho_electron_count_error": -1.9073486328125e-06,
+      "pyscf_converged": true
+    }
+  ],
+  "scf_spacing_convergence": []
+}

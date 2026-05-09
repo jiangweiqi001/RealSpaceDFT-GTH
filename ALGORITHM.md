@@ -18,6 +18,12 @@ The SCF path uses a uniform Cartesian real-space grid created by `create_grid(sp
 - Optional diagnostic controls exist for `dtype` and `grid_phase`.
 - The grid remains uniform; true nonuniform adaptive Kohn-Sham grids are not used.
 
+## Density continuation (coarse-to-fine)
+
+For expensive fine grids, the intended workflow is **SCF on a coarser spacing**, then **interpolate the self-consistent density** onto a finer grid (trilinear remap + electron-count renorm), and call `energy_and_forces(..., initial_rho=...)` or `scf(..., initial_rho=...)` as a warm start. Implementation: `JaxDFT/src/continuation.py`; orchestration and timing: `JaxDFT/scripts/scf_continuation_benchmark.py`.
+
+This is the **primary strategic path** toward **accurate and fast** runs for **CHON**-class benchmarks once multi-stage chains and harness coverage are mature. It does not replace independent validation of Hartree/local components at each spacing.
+
 ## Kinetic Operator
 
 The default SCF path uses the 8th-order centered finite-difference Laplacian. The code also contains 4th- and 6th-order stencils for controlled diagnostics.
@@ -148,7 +154,7 @@ The local and nonlocal pseudopotential component outputs are diagnostics for err
 Important interpretation:
 
 - `density_converged` depends on the selected density residual metric.
-- `energy_converged` depends on the configured energy tolerance.
+- `energy_converged` depends on the configured energy tolerance (Hartree): the maximum of `|E_i - E_{i-1}|` over the last 10 SCF iterations must be at most `energy_tolerance`. Default in code is `5e-6` Ha; difficult CO/H2O fine-grid runs often show `energy_delta_last10_max` around `1e-3` Ha at practical iteration caps, so this flag can remain false until the run is tighter or the tolerance is loosened deliberately for reporting.
 - `scf_converged` is a diagnostic combination of density and energy stability.
 - Current CO/H2O runs often represent practical plateaus or partial convergence, not strict SCF convergence.
 
@@ -180,14 +186,15 @@ The benchmark harness can report:
 ## Current Interpretation
 
 - H2 is within the current target error range.
-- CO/H2O still have systematic `15-25 mHa`-level bias.
-- Mixer changes can improve stability but have not explained the bias.
-- C/O s-projector normalization is not the main explanation.
-- The next numerical target is independent validation of Hartree/Poisson and local GTH conventions.
+- CO/H2O still have systematic `15-25 mHa`-level bias in many practical runs; **same-density** diagnostics show **XC** matches PySCF very closely and **Hartree** vs PySCF `coul` gaps **shrink with finer spacing**; **Gaussian Poisson** tests validate the Poisson path at sub-mHa to ~1 mHa on scanned grids.
+- **Coarse-to-fine continuation** reduces fine-grid SCF iterations and wall time in tested CO cases; productizing multi-stage chains is the main roadmap item for **CHON** accuracy + speed.
+- Mixer changes can improve stability but are secondary to continuation and grid/iteration budgets for the current roadmap.
+- C/O s-projector normalization is not the main explanation for large total bias.
+- Next numerical targets: **continuation harness maturity**, then **local GTH** audit and **nonlocal / N** coverage as benchmarks expand.
 
 ## Out of Scope
 
 - Real forces.
 - Production-level geometry optimization or molecular dynamics.
 - Treating old verification scripts as authoritative without checking current code.
-- Speed/JIT/caching work before the main component-level numerical error source is identified.
+- Speed/JIT/caching work before continuation baselines and component diagnostics are documented for the grids you care about.

@@ -1,144 +1,104 @@
-# Current Best Understanding
+# Status and Handoff
 
-The project now has a reasonably complete diagnostic loop. The main unresolved issue is not benchmark infrastructure or SCF mixer plumbing.
+This file tracks **current evidence**, **completed tooling**, and **what to do next**. It is kept in sync with [AGENTS.md](../AGENTS.md). Authoritative rules for agents remain in `AGENTS.md`.
 
-- H2 is within target.
-- CO/H2O still have systematic `15-25 mHa` errors.
-- Mixer improvements improve stability but do not remove systematic bias.
-- Projector overlap normalization for C/O s-projectors is accurate to roughly `1e-6` and is unlikely to explain the error.
-- CO component diagnostics show Hartree differs from PySCF Coulomb by roughly `44 mHa` at `spacing=0.12`, `box=18`, but this may include density differences; same-density Poisson tests are needed.
-- For C/O systems, the remaining bias is likely in component-level numerical physics: Hartree/Poisson, local GTH potential convention/discretization, or remaining nonlocal angular/operator details.
-- The next agent should start with an independent Gaussian Hartree analytic test before changing SCF mixing again.
+## North Star
 
-# Completed Work
+**Mature coarse-to-fine (density continuation)** for **CHON**-class organics and small molecules: **accurate and fast** under the fixed PySCF reference protocol (`gth-tzvp + gth-lda + lda,pz`), with **reproducible** scripts and JSON reports—not ad-hoc cold starts on the finest grid only.
 
-- `JaxDFT/scripts/benchmark_systems.py` benchmark harness additions for H2/H2O/CO.
-- Fixed PySCF reference protocol: `gth-tzvp + gth-lda + lda,pz`.
-- `return_info=True` diagnostics without changing the default `(energy, forces)` API.
-- Density stabilization and electron-count renormalization.
-- RMS/L2 density residual diagnostics in addition to max density residual.
-- Energy stability diagnostics: `energy_delta_last`, `energy_delta_history`, `energy_delta_last10_max`, `density_converged`, `energy_converged`, `scf_converged`.
-- Optional Pulay/DIIS mixer.
-- Charge-neutral Pulay residual.
-- Optional Kerker residual metric.
-- Optional kinetic orbital preconditioner.
-- C/O GTH parser and `n_proj=0` checks.
-- Projector overlap diagnostics.
-- Local/nonlocal/Hartree component output.
-- Local GTH potential min/max/integral/by-atom diagnostics.
-- Hartree/Poisson potential min/max/integral diagnostics.
-- PySCF reference component output: one-electron, Coulomb, XC, nuclear.
-- Dtype, grid phase, and laplacian-order diagnostic controls.
+Scope path: stabilize **H2 / H2O / CO** + continuation harness → extend benchmarks and continuation chains to **N-containing** systems once GTH data and harness rows exist.
 
-# Important Experimental Results
+---
 
-| Experiment | Observation | Conclusion |
+## Current Best Understanding
+
+1. **Poisson / Hartree (implementation path)**  
+   The independent **Gaussian Hartree** diagnostic (`JaxDFT/scripts/diagnose_poisson_gaussian.py`) shows **sub-mHa to ~1 mHa**-level agreement with the analytic self-energy on moderate grids, improving monotonically as spacing refines. This does **not** support treating the FFT Poisson path as the primary bug for CO/H2O bias.
+
+2. **Same-density components**  
+   `JaxDFT/scripts/diagnose_same_density_components.py`: **XC** matches PySCF `exc` to **sub-0.02 mHa** in tested CO/H2O cases. **Hartree** vs PySCF `coul` gap **shrinks strongly with finer spacing** (same PySCF density on the JaxDFT grid), so **discretization** is a major contributor to the Hartree component gap. Do **not** compare JaxDFT local pseudopotential energy to PySCF `e1` (composite KS term).
+
+3. **Total energy vs spacing (full SCF)**  
+   CO benchmark sweeps show **total error vs PySCF improves as spacing refines**; very fine grids (e.g. dx≈0.08) may hit **`max_iter` caps** with `density_converged=false` unless outer-iteration budget and/or **continuation** is used—treat truncated runs as **trend points only**.
+
+4. **Continuation (coarse-to-fine)**  
+   `energy_and_forces(..., initial_rho=...)` + `JaxDFT/src/continuation.py` + `JaxDFT/scripts/scf_continuation_benchmark.py`. Example **CO 0.2 → 0.15**: warm fine SCF used **fewer outer iterations and less wall time** than cold fine SCF on the same fine grid; **total** wall time can still exceed cold-only when the coarse stage is cheap enough that cold competes—continuation pays most when the **fine** stage is expensive.
+
+5. **Mixer**  
+   Pulay/Kerker remains a **useful diagnostic configuration** for CO/H2O stability, but **blind mixer sweeps** are not the primary lever. **Targeted** mixer / inner-loop tuning may follow once **continuation + budgets** are baseline.
+
+---
+
+## Completed Work (recent + historical)
+
+- Benchmark harness `JaxDFT/scripts/benchmark_systems.py` (H2, H2O, CO); PySCF reference protocol fixed as above.
+- Full `return_info=True` diagnostics; `BenchmarkResult` includes **`xc_energy`**, **`energy_last20_mean` / `energy_last20_std`**, **`scf_status`**; `return_info` includes **`density`** for continuation and post-processing.
+- **Gaussian Poisson diagnostic**: `JaxDFT/scripts/diagnose_poisson_gaussian.py`.
+- **Same-density component diagnostic**: `JaxDFT/scripts/diagnose_same_density_components.py`.
+- **Grid convergence report**: `JaxDFT/scripts/co_grid_convergence_report.py` (tunable `max_iter`, `orbital_max_iter`, etc.).
+- **Continuation**: `JaxDFT/src/continuation.py` (trilinear `rho` remap + charge renorm); `scf_continuation_benchmark.py` (coarse+fine+optional cold comparison).
+- Earlier completed items: density stabilization, RMS/L2 residuals, energy stability fields, Pulay/Kerker optional paths, projector overlap diagnostics, local/nonlocal/Hartree diagnostics, dtype/phase/laplacian-order controls, etc. (see `AGENTS.md` Completed).
+
+---
+
+## Important Experimental Results (updated)
+
+| Topic | Observation | Conclusion |
 | --- | --- | --- |
-| CO `orbital_max_iter=30/60/100` | Larger inner iteration counts did not remove the systematic energy bias. | The issue is not simply insufficient orbital iterations. |
-| Kinetic orbital preconditioner | Orbital residual dropped substantially, but SCF energy drift did not improve decisively. | Do not default-enable kinetic preconditioning as a fix. |
-| RMS/L2 diagnostics | Max density residual can be dominated by localized grid spikes. | RMS/L2 are useful diagnostics, but they do not prove strict SCF convergence alone. |
-| Pulay/DIIS | Often better plateau behavior than Anderson for CO. | Useful diagnostic path, not a final default and not a full accuracy fix. |
-| Charge-neutral Pulay residual | Did not decisively remove CO/H2O bias. | Not enough by itself. |
-| Projector overlap | C/O s-projector overlap error around `1e-6`. | s-channel normalization is unlikely to explain `15-25 mHa` error. |
-| dtype/stencil/phase | mHa-level effects observed. | These do not explain the full CO bias. |
-| box size `18 -> 22 Bohr` | Not a dominant error source in tested cases. | Do not prioritize larger boxes before component validation. |
+| Gaussian Hartree | Errors **well below 10 mHa** on scanned grids; improve with finer spacing. | Poisson/Hartree **implementation** is not the first suspect for large same-density gaps at moderate dx. |
+| Same-density XC | Sub-0.02 mHa vs PySCF `exc` (CO/H2O samples). | XC operator alignment is **excellent** at fixed PySCF ρ. |
+| Same-density Hartree vs `coul` | Gap **~14 → ~7 → ~4.7 mHa** as spacing tightens (CO examples). | **Discretization + grid sampling** explains much of the Hartree gap; not only self-consistent ρ differences. |
+| Full SCF CO spacing sweep | Total error improves with spacing; dx≈0.08 can hit iter cap. | Need **larger `max_iter`** and/or **continuation** for “stable” fine-grid numbers. |
+| CO 0.2→0.15 continuation | Warm fine: **112** iters, **~49.6 s**; cold fine: **170** iters, **~65.3 s**. | Continuation **reduces fine-grid work**; total time vs cold-only depends on coarse cost. |
+| Mixer / `orbital_max_iter` sweeps (historical) | Did not remove systematic CO/H2O bias alone. | Not the primary narrative vs grid + continuation. |
+| Kinetic preconditioner (historical) | Lower orbital residual; did not fix energy drift decisively. | Do not default-enable as the main fix. |
+| Projector s overlap (C/O) | ~1e-6 level. | Unlikely to explain **10+ mHa** bias. |
 
-CO `spacing=0.12`, `box=18` component snapshot from a Pulay/Kerker diagnostic run:
+---
 
-| Quantity | Value |
-| --- | ---: |
-| Total error | `-20.8 mHa` |
-| JaxDFT local pseudopotential energy | `-74.8767 Ha` |
-| JaxDFT nonlocal pseudopotential energy | `+1.8133 Ha` |
-| JaxDFT Hartree energy | `28.8171 Ha` |
-| PySCF Coulomb component | `28.7727 Ha` |
-| Projector overlap max error | `~1.7e-6` |
+## Current Recommended Diagnostic Config
 
-# Current Recommended Diagnostic Config
+Same as `AGENTS.md` (Pulay + Kerker + RMS density metric). For **fine** grids, increase **`max_iter`** (e.g. 500+) and/or **`orbital_max_iter`** when `density_converged` fails or iterations cap.
 
-CO diagnostic reference config:
+When reporting CO/H2O (and future CHON) runs, include: energy, error mHa, density max/RMS/L2, `energy_delta_last10_max`, orbital residual, `scf_converged`, `orbital_converged`, **`energy_last20_mean`/`std`** when available, and whether **`max_iter`** was hit.
 
-```text
-mixing_mode=pulay
-pulay_history=3
-pulay_regularization=1e-4
-mix_alpha=0.2
-pulay_residual_metric=kerker
-kerker_k0=2.0
-scf_convergence_metric=rms
-tolerance=3e-5
-max_iter=200 or 250
-orbital_max_iter=30
-orbital_preconditioner=none
-```
+---
 
-This is a diagnostic reference config, not the final default. The default mixer remains Anderson.
+## Next Recommended Tasks
 
-When reporting CO/H2O results, include:
+**P0 — Productize coarse-to-fine**
 
-- energy
-- error mHa
-- density max/RMS/L2 residuals
-- `energy_delta_last10_max`
-- orbital residual
-- `scf_converged`
-- `orbital_converged`
-- last-window energy mean/std/range if available
+- Multi-stage chains in script or thin driver (e.g. **0.14 → 0.12 → 0.10 → 0.08**), documented defaults, JSON schema for regression.
+- Optional **looser tolerances / smaller coarse `max_iter` only in preheat stages**; **final** stage uses the **same** diagnostic tolerances as published numbers.
 
-# Known Limitations
+**P1 — Regression maintenance**
 
-- Forces are not implemented; returned forces are zero placeholders.
-- SCF strict convergence is not always reached for CO/H2O.
-- Pulay/Kerker are optional and experimental.
-- Hartree/Poisson and local GTH potential still need validation.
-- Current final energy may depend on SCF plateau phase; report last20 mean/std where possible.
-- Full C/O/N angular projector validation is incomplete, especially p-channel / N.
-- CO/H2O remain outside the `<=10 mHa` target.
-- This project should not be described as production-ready or high-accuracy DFT software.
+- Re-run Gaussian + same-density + selected continuation smoke tests when touching grid/Poisson/XC.
 
-# Next Recommended Task
+**P2 — Local GTH audit**
 
-Implement an independent Hartree/Poisson Gaussian analytic diagnostic:
+- After same-density Hartree gap is small at fine dx, audit local potential convention (`r=0`, erf, polynomial) for any **residual mHa** plateau.
 
-```text
-rho(r) = Q * (alpha/pi)^(3/2) * exp(-alpha r^2)
-E_H_exact = Q^2 * sqrt(alpha / (2*pi))
-E_H_num = 0.5 * sum(rho * V_H) * dV
-```
+**P3 — Nonlocal angular / p-channel**
 
-Scan:
+- Especially N and other p-active cases when CHON harness expands.
 
-```text
-spacing = 0.18, 0.14, 0.12, 0.10
-box = 18, 22
-alpha = 0.25, 0.5, 1.0
-```
+**P4 — Mixer / inner loop (secondary)**
 
-Output:
+- Small, justified tweaks on top of continuation baselines—not blind sweeps.
 
-```text
-electron_count
-E_H_num
-E_H_exact
-error_mHa
-relative_error
-self_term_used
-```
+---
 
-Do not change the Poisson implementation in the doc-only handoff task. For the next coding task, implement this as an isolated diagnostic test before changing SCF mixing again.
+## Do Not Do Next
 
-# Do Not Do Next
+- Blind Anderson/Pulay parameter sweeps as the main strategy.
+- Default-enable kinetic preconditioning as the primary fix.
+- Claim strict CO/H2O convergence without energy-stability and iteration-cap evidence.
+- Treat **old** “do not do coarse-to-fine” guidance as current—it is **superseded**: continuation is now **encouraged** (see `AGENTS.md`).
 
-- Do not continue blind Anderson/Pulay parameter sweeps.
-- Do not keep increasing `orbital_max_iter`.
-- Do not default-enable kinetic preconditioning.
-- Do not start with speed/JIT/caching.
-- Do not start with coarse-to-fine continuation.
-- Do not treat CO/H2O final energy as strictly converged unless energy stability passes.
+---
 
-# Verification Commands
-
-Run these before handing off changes:
+## Verification Commands
 
 ```bash
 python3 -m unittest discover -s tests

@@ -10,11 +10,13 @@ For algorithm details, see [ALGORITHM.md](ALGORITHM.md). For current handoff sta
 
 - H2 reaches the current target error range against the fixed PySCF reference protocol.
 - CO and H2O still show systematic roughly `15-25 mHa` total-energy bias in current practical runs. The source is not fully explained.
+- **Long-term direction**: a **mature coarse-to-fine** workflow (density continuation + interpolation warm-start) so **CHON**-class systems can be run **accurate and fast** on fine grids; see [docs/STATUS_AND_HANDOFF.md](docs/STATUS_AND_HANDOFF.md) and [AGENTS.md](AGENTS.md).
+- **Gaussian Poisson** and **same-density** diagnostics show Poisson/XC are well behaved at fixed density; Hartree vs PySCF `coul` gaps **shrink with finer spacing**; total SCF error **trends down** with spacing when iteration budgets allow.
 - CO/H2O SCF results should usually be treated as practical plateaus or partial convergence unless the energy-stability diagnostics pass.
-- The default public API remains `energy, forces = energy_and_forces(...)`.
+- The default public API remains `energy, forces = energy_and_forces(...)`. `return_info=True` includes **`density`** for continuation.
 - The default density mixer remains Anderson mixing.
 - Pulay/DIIS, Kerker-style residual metrics, RMS/L2 convergence metrics, and kinetic orbital preconditioning are optional experimental controls, not the default path.
-- The benchmark harness can report PySCF reference components and JaxDFT local/nonlocal/Hartree components for diagnostics.
+- The benchmark harness can report PySCF reference components and JaxDFT local/nonlocal/Hartree components for diagnostics. **Continuation benchmark**: `JaxDFT/scripts/scf_continuation_benchmark.py`.
 
 ## Known Limitations
 
@@ -109,5 +111,5 @@ This is a diagnostic reference configuration, not a new default algorithm.
 ## Development Notes
 
 - Prefer reading the current code and benchmark output over relying on old comments or historical verification scripts.
-- Do not continue blind mixer parameter sweeps as the next step.
-- Before changing speed/JIT/caching paths, first validate Hartree/Poisson and local GTH potential components independently.
+- **Continuation first**: coarse-to-fine and reproducible continuation chains are the main lever for fine-grid cost and stability; mixer sweeps are secondary.
+- Before changing speed/JIT/caching paths, first validate Hartree/Poisson and local GTH potential components independently and document continuation baselines.

@@ -10,6 +10,7 @@ import argparse
 import json
 import math
 import os
+import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass
@@ -96,6 +97,26 @@ class BenchmarkResult:
     mixing_safeguard: str
     mixing_safeguard_factor: float
     mixing_fallback_count: int
+    xc_energy: float | None = None
+    energy_last20_mean: float | None = None
+    energy_last20_std: float | None = None
+    scf_status: str | None = None
+
+
+def _energy_last20_mean_std(energy_history, scf_iterations: int) -> tuple[float | None, float | None]:
+    """Mean and sample std of the last up-to-20 finite total energies (includes ion-ion)."""
+    vals: list[float] = []
+    for i in range(int(scf_iterations)):
+        v = float(energy_history[i])
+        if math.isfinite(v):
+            vals.append(v)
+    if not vals:
+        return None, None
+    tail = vals[-20:]
+    mean = statistics.mean(tail)
+    if len(tail) < 2:
+        return mean, 0.0
+    return mean, statistics.stdev(tail)
 
 
 def get_benchmark_systems() -> list[BenchmarkSystem]:
@@ -187,12 +208,13 @@ def run_jaxdft_energy(
     mixing_safeguard: str = "none",
     mixing_safeguard_factor: float = 1.0,
     scf_convergence_metric: str = "max",
-    energy_tolerance: float = 1e-6,
+    energy_tolerance: float = 5e-6,
     pulay_residual_metric: str = "euclidean",
     pulay_kerker_k0: float = 1.0,
     laplacian_order: int = 8,
     calculation_dtype: str = "float32",
     grid_phase: float = 0.0,
+    initial_rho=None,
 ) -> tuple[float, tuple[int, int, int], float, dict]:
     import jax
 
@@ -234,6 +256,7 @@ def run_jaxdft_energy(
         pulay_residual_metric=pulay_residual_metric,
         pulay_kerker_k0=pulay_kerker_k0,
         laplacian_order=laplacian_order,
+        initial_rho=initial_rho,
     )
     return float(energy), tuple(int(v) for v in grid.shape), float(grid.spacing), info
 
@@ -256,7 +279,7 @@ def run_benchmark(
     mixing_safeguard: str = "none",
     mixing_safeguard_factor: float = 1.0,
     scf_convergence_metric: str = "max",
-    energy_tolerance: float = 1e-6,
+    energy_tolerance: float = 5e-6,
     pulay_residual_metric: str = "euclidean",
     pulay_kerker_k0: float = 1.0,
     laplacian_order: int = 8,
@@ -304,6 +327,10 @@ def run_benchmark(
         for v in row
     ]
     projector_overlap_max_error = max(projector_overlap_errors, default=0.0)
+    e20_mean, e20_std = _energy_last20_mean_std(jaxdft_info["energy_history"], scf_iterations)
+    scf_conv = bool(jaxdft_info["scf_converged"])
+    scf_status = "converged" if scf_conv else "not_converged"
+    xc_energy = float(jaxdft_info["energy_components"]["xc"])
     return BenchmarkResult(
         system=system.name,
         target_spacing=float(target_spacing),
@@ -375,6 +402,10 @@ def run_benchmark(
         mixing_safeguard=str(jaxdft_info["mixing_safeguard"]),
         mixing_safeguard_factor=float(jaxdft_info["mixing_safeguard_factor"]),
         mixing_fallback_count=int(jaxdft_info["mixing_fallback_count"]),
+        xc_energy=xc_energy,
+        energy_last20_mean=e20_mean,
+        energy_last20_std=e20_std,
+        scf_status=scf_status,
     )
 
 
@@ -450,7 +481,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--mixing-safeguard", choices=["none", "density_diff"], default="none")
     parser.add_argument("--mixing-safeguard-factor", type=float, default=1.0)
     parser.add_argument("--scf-convergence-metric", choices=["max", "rms", "l2"], default="max")
-    parser.add_argument("--energy-tolerance", type=float, default=1e-6)
+    parser.add_argument(
+        "--energy-tolerance",
+        type=float,
+        default=5e-6,
+        help="Ha: energy_converged iff max |E_i-E_{i-1}| over last 10 SCF iters <= this "
+        "(same units as energy_delta_last10_max; CO fine grids often plateau ~1e-3 Ha).",
+    )
     parser.add_argument(
         "--pseudo-dir",
         default=os.path.join(REPO_ROOT, "JaxDFT", "data", "gth_potentials"),

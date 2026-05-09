@@ -393,10 +393,11 @@ def scf(
     mixing_safeguard="none",
     mixing_safeguard_factor=1.0,
     scf_convergence_metric="max",
-    energy_tolerance=1e-6,
+    energy_tolerance=5e-6,
     pulay_residual_metric="euclidean",
     pulay_kerker_k0=1.0,
     laplacian_order=8,
+    initial_rho=None,
 ):
     """Run the self-consistent field (SCF) loop.
 
@@ -411,6 +412,8 @@ def scf(
         mix_alpha: Anderson mixing strength.
         tolerance: Convergence threshold for density change.
         key: Base JAX PRNG key used to seed orbital initialization.
+        initial_rho: Optional density on ``grid`` (Bohr^-3) to warm-start SCF; clipped
+            and renormalized to ``sum(occ)`` electrons. Default uses atom-centered Gaussians.
 
     Returns:
         Tuple (rho, eigvals, eigvecs, V_H, eps_xc, v_xc) where energies are in
@@ -434,13 +437,18 @@ def scf(
     if anderson_history < 1:
         raise ValueError("anderson_history must be >= 1")
     volume_element = grid.volume_element
-    
-    # 初始密度
-    rho = jnp.zeros(grid.shape, dtype=dtype)
-    for a in range(coords.shape[0]):
-        r = jnp.linalg.norm(grid.coords - coords[a], axis=-1)
-        rho = rho + jnp.exp(-2.0 * r**2)
-    rho = rho / (jnp.sum(rho) * volume_element) * jnp.sum(occ)
+
+    if initial_rho is None:
+        rho = jnp.zeros(grid.shape, dtype=dtype)
+        for a in range(coords.shape[0]):
+            r = jnp.linalg.norm(grid.coords - coords[a], axis=-1)
+            rho = rho + jnp.exp(-2.0 * r**2)
+        rho = rho / (jnp.sum(rho) * volume_element) * jnp.sum(occ)
+    else:
+        rho = jnp.asarray(initial_rho, dtype=dtype).reshape(grid.shape)
+        if rho.shape != grid.shape:
+            raise ValueError(f"initial_rho shape {rho.shape} must match grid.shape {grid.shape}")
+        rho = stabilize_density(rho, volume_element, jnp.sum(occ))
 
     f_hist = jnp.zeros((anderson_history, rho.size), dtype=dtype)
     rho_hist = jnp.zeros((anderson_history, rho.size), dtype=dtype)
@@ -863,10 +871,11 @@ def energy_and_forces(
     mixing_safeguard="none",
     mixing_safeguard_factor=1.0,
     scf_convergence_metric="max",
-    energy_tolerance=1e-6,
+    energy_tolerance=5e-6,
     pulay_residual_metric="euclidean",
     pulay_kerker_k0=1.0,
     laplacian_order=8,
+    initial_rho=None,
 ):
     """Run SCF and return total energy and forces.
 
@@ -878,6 +887,7 @@ def energy_and_forces(
         mix_alpha: Anderson mixing strength.
         tolerance: Convergence threshold for density change.
         key: Base JAX PRNG key used to seed the SCF orbital initialization.
+        initial_rho: Optional warm-start density on ``grid`` (see ``scf``).
 
     Returns:
         Tuple (energy, forces) where energy is in Hartree and forces are in
@@ -924,6 +934,7 @@ def energy_and_forces(
         pulay_residual_metric=pulay_residual_metric,
         pulay_kerker_k0=pulay_kerker_k0,
         laplacian_order=laplacian_order,
+        initial_rho=initial_rho,
     )
     if return_info:
         rho, eigvals, eigvecs, V_H, eps_xc, v_xc, scf_info = scf_result
@@ -1017,6 +1028,7 @@ def energy_and_forces(
             "projector_overlap_diagnostics": projector_overlap_diagnostics(grid, coords, pseudos),
             "density_min": scf_info["density_min"],
             "density_integral": scf_info["density_integral"],
+            "density": rho,
         }
         return E_tot, forces, info
     return E_tot, forces

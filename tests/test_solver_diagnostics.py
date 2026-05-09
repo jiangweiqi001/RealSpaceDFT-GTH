@@ -103,6 +103,7 @@ class SolverDiagnosticsTest(unittest.TestCase):
         self.assertIn("orbital_residual_history", info)
         self.assertIn("density_min", info)
         self.assertIn("density_integral", info)
+        self.assertIn("density", info)
         self.assertEqual(1, int(info["n_bands"]))
         self.assertEqual((1,), tuple(info["occupations"].shape))
         self.assertEqual((1,), tuple(info["eigenvalues"].shape))

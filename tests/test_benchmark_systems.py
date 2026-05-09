@@ -60,6 +60,7 @@ class BenchmarkSystemsTest(unittest.TestCase):
                         "local_pseudopotential": -2.0,
                         "nonlocal_pseudopotential": 0.25,
                         "hartree": 0.75,
+                        "xc": -0.03,
                         "local_pseudopotential_by_atom": [-1.2, -0.8],
                     },
                     "local_pseudopotential_min": -3.0,
@@ -181,6 +182,10 @@ class BenchmarkSystemsTest(unittest.TestCase):
             self.assertEqual("l2", result.scf_convergence_metric)
             self.assertAlmostEqual(1e-7, result.energy_tolerance)
             self.assertAlmostEqual(-10.0, result.error_mha)
+            self.assertAlmostEqual(-0.03, result.xc_energy)
+            self.assertAlmostEqual(-0.6025, result.energy_last20_mean, places=4)
+            self.assertAlmostEqual(0.42367994625553933, result.energy_last20_std, places=6)
+            self.assertEqual("not_converged", result.scf_status)
         finally:
             benchmarks.run_pyscf_reference = original_reference
             benchmarks.run_pyscf_reference_with_components = original_reference_with_components

@@ -1,0 +1,123 @@
+{
+  "config": {
+    "system": "CO",
+    "box_size": 18.0,
+    "scf": {
+      "mixing_mode": "pulay",
+      "pulay_history": 3,
+      "pulay_regularization": 0.0001,
+      "mix_alpha": 0.2,
+      "pulay_residual_metric": "kerker",
+      "pulay_kerker_k0": 2.0,
+      "scf_convergence_metric": "rms",
+      "tolerance": 3e-05,
+      "max_iter": 250,
+      "orbital_max_iter": 30,
+      "orbital_preconditioner": "none",
+      "energy_tolerance": 1e-06
+    }
+  },
+  "same_density_hartree_mHa": [],
+  "scf_spacing_convergence": [
+    {
+      "spacing": 0.13953489065170288,
+      "target_spacing": 0.14,
+      "grid_shape": [
+        130,
+        130,
+        130
+      ],
+      "runtime_seconds": 60.90042519569397,
+      "final_energy": -21.679899215698242,
+      "energy_last20_mean": -21.682220268249512,
+      "energy_last20_std": 0.0027179757749576008,
+      "total_error_mHa": -25.83067752031809,
+      "local_pseudopotential_energy": -74.89021301269531,
+      "nonlocal_pseudopotential_energy": 1.8144837617874146,
+      "hartree_energy": 28.816835403442383,
+      "xc_energy": -4.970257759094238,
+      "density_rms_diff": 2.772139123408124e-05,
+      "energy_delta_last10_max": 0.0106048583984375,
+      "scf_status": "not_converged",
+      "scf_iterations": 105,
+      "density_converged": true,
+      "energy_converged": false,
+      "orbital_converged": false
+    },
+    {
+      "spacing": 0.11999999731779099,
+      "target_spacing": 0.12,
+      "grid_shape": [
+        151,
+        151,
+        151
+      ],
+      "runtime_seconds": 124.8084864616394,
+      "final_energy": -21.675718307495117,
+      "energy_last20_mean": -21.67623348236084,
+      "energy_last20_std": 0.0009205883040578681,
+      "total_error_mHa": -21.64976931724283,
+      "local_pseudopotential_energy": -74.8698501586914,
+      "nonlocal_pseudopotential_energy": 1.8135708570480347,
+      "hartree_energy": 28.811744689941406,
+      "xc_energy": -4.96868896484375,
+      "density_rms_diff": 2.8440201276680455e-05,
+      "energy_delta_last10_max": 0.001995086669921875,
+      "scf_status": "not_converged",
+      "scf_iterations": 141,
+      "density_converged": true,
+      "energy_converged": false,
+      "orbital_converged": false
+    },
+    {
+      "spacing": 0.10000000149011612,
+      "target_spacing": 0.1,
+      "grid_shape": [
+        181,
+        181,
+        181
+      ],
+      "runtime_seconds": 228.83697628974915,
+      "final_energy": -21.672197341918945,
+      "energy_last20_mean": -21.67186336517334,
+      "energy_last20_std": 0.0008967186471589935,
+      "total_error_mHa": -18.128803741049637,
+      "local_pseudopotential_energy": -74.863037109375,
+      "nonlocal_pseudopotential_energy": 1.8128464221954346,
+      "hartree_energy": 28.81447982788086,
+      "xc_energy": -4.968440532684326,
+      "density_rms_diff": 2.910853254434187e-05,
+      "energy_delta_last10_max": 0.002475738525390625,
+      "scf_status": "not_converged",
+      "scf_iterations": 141,
+      "density_converged": true,
+      "energy_converged": false,
+      "orbital_converged": false
+    },
+    {
+      "spacing": 0.07999999821186066,
+      "target_spacing": 0.08,
+      "grid_shape": [
+        226,
+        226,
+        226
+      ],
+      "runtime_seconds": 768.6592946052551,
+      "final_energy": -21.664052963256836,
+      "energy_last20_mean": -21.664359283447265,
+      "energy_last20_std": 0.0009799361775012607,
+      "total_error_mHa": -9.98442507897579,
+      "local_pseudopotential_energy": -74.8610610961914,
+      "nonlocal_pseudopotential_energy": 1.8135381937026978,
+      "hartree_energy": 28.812196731567383,
+      "xc_energy": -4.96813440322876,
+      "density_rms_diff": 6.076899808249436e-05,
+      "energy_delta_last10_max": 0.002185821533203125,
+      "scf_status": "not_converged",
+      "scf_iterations": 250,
+      "density_converged": false,
+      "energy_converged": false,
+      "orbital_converged": false
+    }
+  ]
+}
