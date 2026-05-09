@@ -222,8 +222,9 @@ def parse_gth_text(text):
                 h_mat[i + j_offset, i] = val  # 利用对称性填充下三角
             idx += 1
             
-        poly = np.arange(n_proj, dtype=int)
-        projectors.append(GTHProjector(l=l_cur, r=r, h=h_mat, poly=poly))
+        if n_proj > 0:
+            poly = np.arange(n_proj, dtype=int)
+            projectors.append(GTHProjector(l=l_cur, r=r, h=h_mat, poly=poly))
         l_cur += 1
         
     return GTHPP(symbol=symbol, q=q, local=local, projectors=projectors)
